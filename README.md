@@ -30,6 +30,7 @@ sam3_pipeline/
 ├── references/               # Reference images for image prompts
 ├── outputs/                  # Detection results
 ├── config.json               # Class definitions
+├── config_editor.py          # Visual config editor (standalone, see below)
 ├── extract.py                # Step 1: pre-compute prompt features
 └── infer.py                  # Step 2: run detection
 ```
@@ -45,7 +46,7 @@ All commands run inside the `sam3_trt` Docker container (see [`setup/`](setup/) 
 
 ### Step 1: Configure classes
 
-Edit `config.json`:
+Edit `config.json` by hand, or use the visual editor (see [Config Editor](#config-editor) below):
 
 ```json
 {
@@ -175,18 +176,21 @@ Text description + reference image. Features are concatenated.
 
 | Constraint | Value |
 |------------|-------|
-| Max classes | 4 (decoder batch dimension) |
+| Max classes | 8 (decoder batch dimension; adjustable, see [`setup/README.md`](setup/README.md)) |
 | Max prompt tokens | 60 (text=32, each geo box=2 tokens) |
 | Max geo boxes per class | 20 |
 
-## Performance (benchmarked)
+## Performance & VRAM (benchmarked on RTX 5090)
 
-| Classes | Avg ms/frame | Est. FPS |
-|---------|-------------|----------|
-| 1 (text) | ~50 ms | ~20 |
-| 2 (text) | ~53 ms | ~17 |
+| Classes | Engine batch | Avg ms/frame | Est. FPS | VRAM |
+|---------|-------------|-------------|----------|------|
+| 4 (3 text + 1 image) | maxShapes=4 | ~70 ms | ~14 | **~5.0 GB** |
+| 4 (3 text + 1 image) | maxShapes=8 | ~70 ms | ~14 | **~7.5 GB** |
 
-First frame includes warmup and is slower (~100–350 ms).
+- First frame includes warmup and is slower (~100–350 ms)
+- VRAM is dominated by TensorRT activation memory, pre-allocated for `maxShapes` at engine load time
+- Actual class count has little impact on VRAM — the engine reserves memory for the maximum batch regardless
+- To change the max class limit, rebuild engines with a different batch size (see [`setup/README.md`](setup/README.md))
 
 ## Two-Step Workflow
 
@@ -197,3 +201,38 @@ config.json  ──>  extract.py  ──>  features/   ──>  infer.py  ──
 
 Only `extract.py` needs the text/geometry encoders. `infer.py` only loads the
 vision encoder + decoder, making it fast and lightweight.
+
+## Config Editor
+
+A standalone visual tool for editing `config.json`. Especially useful for **image prompts**, where you need to draw bounding boxes on reference images to get the normalised cxcywh coordinates.
+
+- **No dependencies** — pure Python (`http.server`), single file, no pip install needed
+- **No Docker required** — runs directly on the host machine
+- **Does not affect the pipeline** — only reads/writes `config.json` and serves reference images
+
+### Usage
+
+```bash
+# Run directly on host (NOT inside Docker)
+python3 /home/ubuntu/Documents/willy/repos/william/VisionDSL/models/sam3_pipeline/config_editor.py \
+  --config /home/ubuntu/Documents/willy/repos/william/VisionDSL/models/sam3_pipeline/config.json
+```
+
+Then open `http://localhost:8080` in your browser.
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | `config.json` in script directory | Path to config.json |
+| `--port` | `8080` | HTTP port |
+
+### Features
+
+- Add/delete classes (max 8), edit name and prompt type
+- Text prompts: edit the text field directly
+- Image prompts: select a reference image, click-drag to draw bounding boxes on a canvas
+- Each box has a positive/negative label toggle
+- Normalised cxcywh coordinates are computed automatically
+- Save with button or `Ctrl+S`, dirty state tracking
+- Dark theme UI

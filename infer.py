@@ -33,7 +33,7 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 
 LOG = trt.Logger(trt.Logger.WARNING)
-MAX_CLASSES = 4
+MAX_CLASSES = 8
 IMAGE_SIZE = 1008
 
 FPN_SHAPES = [

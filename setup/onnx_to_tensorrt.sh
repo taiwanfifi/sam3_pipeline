@@ -23,9 +23,16 @@
 #
 #  動態維度 (Dynamic Shapes) 概念：
 #    TensorRT 引擎在轉換時需要知道每個輸入的維度範圍。
-#    例如 batch 維度設定 min=1, opt=4, max=4，
-#    表示這個引擎最少處理 1 張圖、最多 4 張、最常處理 4 張。
+#    例如 batch 維度設定 min=1, opt=8, max=8，
+#    表示這個引擎最少處理 1 個類別、最多 8 個、最常處理 8 個。
 #    如果實際 batch 超過 max，引擎會報錯。
+#
+#  MAX_CLASSES 設定：
+#    所有引擎的 maxShapes batch 維度決定了最大可用類別數。
+#    預設值為 8。如需調整，修改下方所有 maxShapes 和 optShapes
+#    裡的 batch 數字（例如把所有 8 改成 4 或 16）。
+#    batch 越大 → VRAM 越高（引擎會為最大值預留記憶體）。
+#    詳見 setup/README.md 的「最大類別數」章節。
 #
 #  使用方式（在 TensorRT 容器內執行）：
 #    bash onnx_to_tensorrt.sh <onnx 資料夾路徑>
@@ -68,7 +75,7 @@ echo ""
 # 輸入：images [B, 3, 1008, 1008]  （RGB 圖片）
 # 輸出：3 層 FPN 特徵 + 1 個位置編碼
 #
-# batch 維度：min=1（單張）, max=4（最多同時 4 張）
+# batch 維度：min=1, max=8（= MAX_CLASSES）
 # 這是最大的模型（~880MB ONNX），轉換時間最長
 # -------------------------------------------------------------------------
 echo "=== [1/4] Vision Encoder ==="
@@ -76,8 +83,8 @@ trtexec --fp16 \
     --onnx="$ONNX_DIR/vision-encoder.onnx" \
     --saveEngine="$OUT_DIR/vision-encoder.engine" \
     --minShapes=images:1x3x1008x1008 \
-    --optShapes=images:4x3x1008x1008 \
-    --maxShapes=images:4x3x1008x1008
+    --optShapes=images:8x3x1008x1008 \
+    --maxShapes=images:8x3x1008x1008
 
 # -------------------------------------------------------------------------
 # [2/4] Text Encoder — 文字編碼器
@@ -93,8 +100,8 @@ trtexec --fp16 \
     --onnx="$ONNX_DIR/text-encoder.onnx" \
     --saveEngine="$OUT_DIR/text-encoder.engine" \
     --minShapes=input_ids:1x32,attention_mask:1x32 \
-    --optShapes=input_ids:4x32,attention_mask:4x32 \
-    --maxShapes=input_ids:4x32,attention_mask:4x32
+    --optShapes=input_ids:8x32,attention_mask:8x32 \
+    --maxShapes=input_ids:8x32,attention_mask:8x32
 
 # -------------------------------------------------------------------------
 # [3/4] Geometry Encoder — 幾何編碼器
@@ -113,7 +120,7 @@ trtexec --fp16 \
     --saveEngine="$OUT_DIR/geometry-encoder.engine" \
     --minShapes=input_boxes:1x1x4,input_boxes_labels:1x1,fpn_feat_2:1x256x72x72,fpn_pos_2:1x256x72x72 \
     --optShapes=input_boxes:1x8x4,input_boxes_labels:1x8,fpn_feat_2:1x256x72x72,fpn_pos_2:1x256x72x72 \
-    --maxShapes=input_boxes:4x20x4,input_boxes_labels:4x20,fpn_feat_2:4x256x72x72,fpn_pos_2:4x256x72x72
+    --maxShapes=input_boxes:8x20x4,input_boxes_labels:8x20,fpn_feat_2:8x256x72x72,fpn_pos_2:8x256x72x72
 
 # -------------------------------------------------------------------------
 # [4/4] Decoder — 解碼器
@@ -125,7 +132,7 @@ trtexec --fp16 \
 #       prompt_features [B, prompt_len, 256]      （prompt 特徵）
 #       prompt_mask [B, prompt_len]               （有效位遮罩）
 #
-# B = 類別數量（最多 4）— 每個類別獨立解碼
+# B = 類別數量（最多 8，由 maxShapes 決定）— 每個類別獨立解碼
 # prompt_len = prompt token 數（最多 60）：
 #   - 文字 prompt: 32 tokens
 #   - 幾何 prompt: num_boxes*2 + 1 tokens
@@ -137,7 +144,7 @@ trtexec --fp16 \
     --saveEngine="$OUT_DIR/decoder.engine" \
     --minShapes=fpn_feat_0:1x256x288x288,fpn_feat_1:1x256x144x144,fpn_feat_2:1x256x72x72,fpn_pos_2:1x256x72x72,prompt_features:1x1x256,prompt_mask:1x1 \
     --optShapes=fpn_feat_0:1x256x288x288,fpn_feat_1:1x256x144x144,fpn_feat_2:1x256x72x72,fpn_pos_2:1x256x72x72,prompt_features:1x33x256,prompt_mask:1x33 \
-    --maxShapes=fpn_feat_0:4x256x288x288,fpn_feat_1:4x256x144x144,fpn_feat_2:4x256x72x72,fpn_pos_2:4x256x72x72,prompt_features:4x60x256,prompt_mask:4x60
+    --maxShapes=fpn_feat_0:8x256x288x288,fpn_feat_1:8x256x144x144,fpn_feat_2:8x256x72x72,fpn_pos_2:8x256x72x72,prompt_features:8x60x256,prompt_mask:8x60
 
 echo ""
 echo "轉換完成！4 個引擎已儲存到 $OUT_DIR"

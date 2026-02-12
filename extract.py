@@ -27,7 +27,7 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 
 LOG = trt.Logger(trt.Logger.WARNING)
-MAX_CLASSES = 4
+MAX_CLASSES = 8
 
 
 # ---------------------------------------------------------------------------
@@ -70,16 +70,23 @@ def fill(buf, arr: np.ndarray):
 
 
 def execute(ctx, inputs, outputs, stream):
-    """Set shapes → H2D → execute → D2H → sync → return numpy list."""
+    """Set shapes → realloc outputs → H2D → execute → D2H → sync → return numpy list."""
     for b in inputs:
         ctx.set_input_shape(b["name"], b["shape"])
         ctx.set_tensor_address(b["name"], b["gpu"])
         cuda.memcpy_htod_async(b["gpu"], b["host"], stream)
-    for b in outputs:
-        ctx.set_tensor_address(b["name"], b["gpu"])
-    ctx.execute_async_v3(stream_handle=stream.handle)
+    # After setting input shapes, TRT can infer output shapes — grow buffers if needed
     for b in outputs:
         b["shape"] = tuple(ctx.get_tensor_shape(b["name"]))
+        n = int(np.prod(b["shape"]))
+        if n > b["capacity"]:
+            b["gpu"].free()
+            cap = int(n * 2)
+            b["host"] = cuda.pagelocked_empty(cap, b["dtype"])
+            b["gpu"] = cuda.mem_alloc(b["host"].nbytes)
+            b["capacity"] = cap
+        ctx.set_tensor_address(b["name"], b["gpu"])
+    ctx.execute_async_v3(stream_handle=stream.handle)
     for b in outputs:
         cuda.memcpy_dtoh_async(b["host"], b["gpu"], stream)
     stream.synchronize()

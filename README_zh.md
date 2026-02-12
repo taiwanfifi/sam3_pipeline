@@ -30,6 +30,7 @@ sam3_pipeline/
 ├── references/               # 放參考圖片（image prompt 用）
 ├── outputs/                  # 偵測結果輸出
 ├── config.json               # 類別定義
+├── config_editor.py          # 視覺化設定編輯器（獨立工具，見下方說明）
 ├── extract.py                # 第一步：預先計算 prompt 特徵
 └── infer.py                  # 第二步：跑偵測推論
 ```
@@ -45,7 +46,7 @@ sam3_pipeline/
 
 ### 第一步：設定要偵測的類別
 
-編輯 `config.json`：
+手動編輯 `config.json`，或使用視覺化編輯器（見下方 [Config 編輯器](#config-編輯器)）：
 
 ```json
 {
@@ -194,18 +195,21 @@ docker exec william_tensorrt python3 \
 
 | 限制 | 值 |
 |------|-----|
-| 最多類別數 | 4（decoder 的 batch 維度上限） |
+| 最多類別數 | 8（decoder 的 batch 維度上限；可調整，見 [`setup/README.md`](setup/README.md)） |
 | 最大 prompt token 數 | 60（text=32，每個 geo box=2 tokens） |
 | 每個類別最多參考框數 | 20 |
 
-## 效能參考
+## 效能與 VRAM（RTX 5090 實測）
 
-| 類別數 | 平均耗時/幀 | 預估 FPS |
-|--------|------------|----------|
-| 1 (text) | ~50 ms | ~20 |
-| 2 (text) | ~53 ms | ~17 |
+| 類別數 | 引擎 batch | 平均耗時/幀 | 預估 FPS | VRAM 佔用 |
+|--------|-----------|------------|----------|----------|
+| 4（3 text + 1 image） | maxShapes=4 | ~70 ms | ~14 | **~5.0 GB** |
+| 4（3 text + 1 image） | maxShapes=8 | ~70 ms | ~14 | **~7.5 GB** |
 
-首幀因為包含暖機會較慢（~100–350 ms），後續幀穩定。
+- 首幀因為包含暖機會較慢（~100–350 ms），後續幀穩定
+- VRAM 主要被 TensorRT 的 activation memory 吃掉，在引擎載入時就會按 `maxShapes` 預先分配
+- 實際用幾個類別對 VRAM 影響極小 — 引擎會為最大 batch 預留記憶體，不管你實際用了幾個
+- 要改變最大類別數，需要用不同的 batch 重建引擎（見 [`setup/README.md`](setup/README.md)）
 
 ## 整體流程圖
 
@@ -216,6 +220,41 @@ config.json  ──>  extract.py  ──>  features/   ──>  infer.py  ──
 
 **重點：** `extract.py` 用到 text/geometry encoder，但 `infer.py` 只載入 vision encoder + decoder，所以推論時很快且佔用資源少。
 
+## Config 編輯器
+
+視覺化的 `config.json` 編輯工具。特別適合 **image prompt** — 可以在參考圖片上直接框選目標，自動計算正規化的 cxcywh 座標。
+
+- **零依賴** — 純 Python（`http.server`），單一檔案，不需要 pip install
+- **不需要 Docker** — 直接在本機執行
+- **完全獨立** — 只讀寫 `config.json` 和提供 references/ 裡的圖片，不影響管線運作
+
+### 使用方式
+
+```bash
+# 在本機直接執行（不需要進 Docker）
+python3 /home/ubuntu/Documents/willy/repos/william/VisionDSL/models/sam3_pipeline/config_editor.py \
+  --config /home/ubuntu/Documents/willy/repos/william/VisionDSL/models/sam3_pipeline/config.json
+```
+
+然後在瀏覽器打開 `http://localhost:8080`。
+
+### 參數
+
+| 參數 | 預設值 | 說明 |
+|------|--------|------|
+| `--config` | 腳本同目錄的 `config.json` | config.json 路徑 |
+| `--port` | `8080` | HTTP 埠號 |
+
+### 功能
+
+- 新增/刪除類別（最多 8 個），編輯名稱和 prompt 類型
+- 文字 prompt：直接編輯文字欄位
+- 圖片 prompt：選擇參考圖片，在畫布上拖曳框選 bounding box
+- 每個框可以切換正樣本/負樣本標籤
+- 正規化的 cxcywh 座標自動計算
+- 按鈕或 `Ctrl+S` 儲存，有未儲存狀態提示
+- 深色主題 UI
+
 ## 常見問題
 
 **Q: 改了類別要重跑哪個？**
@@ -224,8 +263,8 @@ A: 只要重跑 `extract.py`，它會自動跳過沒改的類別，只重算改�
 **Q: image prompt 效果如何？**
 A: geometry encoder 原本設計是同張圖片內使用，跨圖片的參考效果需要實測。建議先用 text prompt 確認管線正常，再試 image prompt。
 
-**Q: 可以超過 4 個類別嗎？**
-A: 需要重新匯出 decoder engine（用 `trtexec` 調高 maxShapes 的 batch），不需要重新訓練模型。
+**Q: 可以超過 8 個類別嗎？**
+A: 可以。修改 `setup/onnx_to_tensorrt.sh` 裡所有引擎的 maxShapes batch 數字（例如改成 16），重新轉換引擎即可。不需要重新訓練模型，也不需要重新匯出 ONNX。代價是 VRAM 會增加。詳見 [`setup/README.md`](setup/README.md) 的「最大類別數」章節。
 
 **Q: 影片輸出太多檔案怎麼辦？**
 A: 用 `--interval` 減少處理幀數。Mask PNG 預設關閉，只有加 `--masks` 才會輸出。

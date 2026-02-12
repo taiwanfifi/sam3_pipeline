@@ -255,6 +255,55 @@ docker exec sam3_trt nvidia-smi          # 查看 GPU 資訊
 
 ---
 
+## 最大類別數（MAX_CLASSES）與 VRAM
+
+### 原理
+
+SAM3 的 decoder 用 **batch 維度** 來同時處理多個類別 — batch=1 就是 1 個類別，batch=4 就是 4 個類別。TensorRT 引擎在轉換時需要指定 `maxShapes`（所有輸入的最大維度），這個值會**鎖死**引擎能處理的最大 batch。
+
+重點：**TensorRT 會為 maxShapes 預留 activation memory**，不管你實際用幾個類別，VRAM 佔用量都差不多。所以選擇 maxShapes 本質上就是在選擇「VRAM 預算」。
+
+### 實測 VRAM（RTX 5090, 4 classes: 3 text + 1 image）
+
+| 引擎 maxShapes | VRAM 佔用 | 適合 GPU |
+|----------------|-----------|----------|
+| batch=4 | **~5.0 GB** | 8 GB 以上 |
+| batch=8（預設） | **~7.5 GB** | 12 GB 以上 |
+| batch=16（估計） | **~12 GB** | 16 GB 以上 |
+
+> VRAM 主要被 decoder 的 FPN 特徵圖吃掉（`fpn_feat_0` 每個 class 佔 ~80 MB），加上 TensorRT 內部的 activation memory。
+> Image prompt 的 class 比 text prompt 略大（多了 geometry 特徵），但差異在 1-2 MB 以內，可忽略。
+
+### 如何調整
+
+修改 `onnx_to_tensorrt.sh`，把**所有** `maxShapes` 和 `optShapes` 裡的 batch 數字統一改掉：
+
+```bash
+# 例如改成 max 4 classes：
+# 把所有 8x... 改成 4x...
+--optShapes=images:4x3x1008x1008
+--maxShapes=images:4x3x1008x1008
+# ... 對所有 4 個引擎都要改
+```
+
+**必須同時改 4 個引擎**（vision-encoder、text-encoder、geometry-encoder、decoder），batch 數字要一致。
+
+改完後重新轉換：
+
+```bash
+docker exec sam3_trt bash /root/sam3_pipeline/setup/onnx_to_tensorrt.sh \
+  /root/sam3_pipeline/setup/onnx
+```
+
+然後把 `extract.py`、`infer.py`、`config_editor.py` 裡的 `MAX_CLASSES` 常數也改成對應的值。
+
+### 預設引擎
+
+`engines/` 裡的預設引擎為 **batch=8**（MAX_CLASSES=8）。
+`engines/backup_batch4/` 保留了 batch=4 版本，如需切換可直接覆蓋。
+
+---
+
 ## 常見問題
 
 | 問題 | 解法 |
@@ -262,7 +311,7 @@ docker exec sam3_trt nvidia-smi          # 查看 GPU 資訊
 | 引擎載入失敗 / segfault | 你的 GPU 跟轉換時不同，需要重新執行 `onnx_to_tensorrt.sh` |
 | ONNX 匯出失敗 | 確認 PyTorch 和 transformers 版本，需要 `transformers>=5.0` |
 | `docker: permission denied` | 把使用者加入 docker 群組：`sudo usermod -aG docker $USER` |
-| VRAM 不足 | 你的 GPU 記憶體可能不夠，可以試試減少 `--maxShapes` 的 batch |
+| VRAM 不足 | 改用較小的 maxShapes batch（見上方「最大類別數」章節），或檢查是否有其他程式佔用 GPU |
 | `tokenizers` import error | `pip install tokenizers`（只有 extract.py 需要） |
 | `ROIAlign_TRT plugin not found` | 程式碼已處理（`trt.init_libnvinfer_plugins`），不需額外操作 |
 
