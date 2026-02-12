@@ -1,0 +1,23 @@
+{
+  "engines": "engines",
+  "tokenizer": "engines/tokenizer.json",
+  "features": "features",
+  "confidence": 0.3,
+  "classes": [
+    {
+      "name": "person",
+      "prompt_type": "text",
+      "text": "person"
+    },
+    {
+      "name": "counter",
+      "prompt_type": "text",
+      "text": "counter"
+    },
+    {
+      "name": "hand",
+      "prompt_type": "text",
+      "text": "hand"
+    }
+  ]
+}
