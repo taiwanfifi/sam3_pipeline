@@ -10,9 +10,9 @@ Usage (inside sam3_trt container):
   python3 infer.py --config config.json \
     --images Inputs/demo_3.jpg --output outputs
 
-  # Video with frame sampling
+  # Video (adaptive real-time simulation)
   python3 infer.py --config config.json \
-    --video Inputs/media1.mp4 --output outputs --interval 30
+    --video Inputs/media1.mp4 --output outputs
 
   # Include per-class mask PNGs
   python3 infer.py --config config.json \
@@ -21,6 +21,7 @@ Usage (inside sam3_trt container):
 import cv2
 import json
 import time
+import shutil
 import argparse
 import numpy as np
 from datetime import datetime
@@ -368,9 +369,25 @@ def run_images(pipe, paths, out_dir, conf, with_masks, tag):
 # ---------------------------------------------------------------------------
 
 def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
+    """Adaptive real-time video inference.
+
+    Simulates real-time playback: after each inference the video clock
+    advances by the actual inference time.  Frames that "arrive" while
+    the GPU is busy are dropped — exactly like a live camera feed.
+
+    --interval acts as a minimum frame gap (default 1 = no artificial
+    limit, pure GPU-adaptive).  Setting --interval 5 means "process at
+    most every 5th source frame", useful for limiting output size.
+
+    Phase 1: inference → temp overlay JPGs + streaming JSONL
+    Phase 2: combine JPGs into AVI at the exact achieved fps
+             (fps = n_processed / source_duration, no drift)
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     jsonl = out_dir / f"{tag}_detections.jsonl"
     avi   = out_dir / f"{tag}_output.avi"
+    tmp   = out_dir / f".tmp_{tag}"
+    tmp.mkdir(exist_ok=True)
     times = []
 
     cap = cv2.VideoCapture(video_path)
@@ -378,39 +395,43 @@ def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
         print(f"ERROR: cannot open {video_path}")
         return times
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out_fps = fps / interval
-    print(f"Video: {total} frames, {fps:.1f} fps, interval={interval}")
-    print(f"Output AVI: {avi.name} @ {out_fps:.1f} fps")
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = total / src_fps
+    min_advance = interval / src_fps   # minimum clock step (seconds)
 
-    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-    writer = cv2.VideoWriter(str(avi), fourcc, out_fps, (w, h))
+    print(f"Video: {total} frames, {src_fps:.1f} fps, "
+          f"duration {duration:.1f}s, interval>={interval}")
 
-    idx = 0
+    # --- Phase 1: adaptive inference → temp JPGs + JSONL ---
+    video_clock = 0.0
+    next_idx = 0       # next source frame to process
+    n_out = 0          # overlay frames written
+    frame_idx = -1
+
     with open(jsonl, "w") as f:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
-            if idx % interval != 0:
-                idx += 1
-                continue
-            idx += 1
+            frame_idx += 1
+
+            if frame_idx < next_idx:
+                continue                           # drop (GPU was busy)
 
             t0 = time.time()
             dets = pipe.detect(frame, conf)
             dt = time.time() - t0
             times.append(dt)
 
-            frame_idx = idx - 1  # actual frame number (before increment)
-            ts = timestamp(frame_idx, fps)
+            ts = timestamp(frame_idx, src_fps)
             print(f"[{ts}] #{frame_idx}: {len(dets)} dets, {dt*1000:.0f} ms")
 
             overlay = draw_overlay(frame, dets)
-            writer.write(overlay)
+            cv2.imwrite(str(tmp / f"{n_out:06d}.jpg"), overlay)
+            n_out += 1
 
             if with_masks and dets:
                 save_masks(dets, frame.shape[:2], out_dir, ts)
@@ -422,9 +443,29 @@ def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
 
-    writer.release()
+            # advance video clock by real inference time (or interval floor)
+            video_clock += max(dt, min_advance)
+            next_idx = int(video_clock * src_fps)
+            if next_idx <= frame_idx:
+                next_idx = frame_idx + 1            # at least move forward
+
     cap.release()
-    print(f"\nProcessed {len(times)}/{total} frames")
+    print(f"\nProcessed {n_out}/{total} frames")
+
+    # --- Phase 2: combine temp JPGs → AVI at exact fps ---
+    if n_out > 0:
+        actual_fps = n_out / duration
+        print(f"Combining AVI @ {actual_fps:.1f} fps ...")
+
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        writer = cv2.VideoWriter(str(avi), fourcc, actual_fps, (w, h))
+        for i in range(n_out):
+            img = cv2.imread(str(tmp / f"{i:06d}.jpg"))
+            writer.write(img)
+        writer.release()
+        print(f"Output: {avi.name}")
+
+    shutil.rmtree(tmp, ignore_errors=True)
     return times
 
 
@@ -465,7 +506,8 @@ def main():
 
     ap.add_argument("--output", default="outputs", help="Output directory")
     ap.add_argument("--conf", type=float, default=None)
-    ap.add_argument("--interval", type=int, default=1, help="Frame interval (video)")
+    ap.add_argument("--interval", type=int, default=1,
+                    help="Min frame gap (video); 1=GPU-adaptive, N=at most every Nth frame")
     ap.add_argument("--masks", action="store_true", help="Save per-class mask PNGs")
     args = ap.parse_args()
 
