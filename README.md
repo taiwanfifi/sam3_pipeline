@@ -82,16 +82,20 @@ docker exec william_tensorrt python3 \
   --output /root/VisionDSL/models/sam3_pipeline/outputs
 ```
 
-**Video:**
+**Video (adaptive real-time):**
 
 ```bash
 docker exec william_tensorrt python3 \
   /root/VisionDSL/models/sam3_pipeline/infer.py \
   --config /root/VisionDSL/models/sam3_pipeline/config.json \
   --video /root/VisionDSL/models/sam3_pipeline/Inputs/media1.mp4 \
-  --output /root/VisionDSL/models/sam3_pipeline/outputs \
-  --interval 30
+  --output /root/VisionDSL/models/sam3_pipeline/outputs
 ```
+
+Video mode simulates real-time playback: after each inference, the video clock
+advances by the actual inference time. Frames that arrive while the GPU is busy
+are dropped. The output AVI plays at the exact achieved fps, matching the
+original video duration with zero drift.
 
 ## Output Files
 
@@ -123,7 +127,7 @@ Each run produces timestamped output files (`YYYYMMDD_HHMMSS` prefix), so multip
 | `--video` | — | Video file path |
 | `--output` | `outputs` | Output directory |
 | `--conf` | from config | Confidence threshold override |
-| `--interval` | `1` | Process every Nth frame (video mode) |
+| `--interval` | `1` | Min frame gap (video); 1=GPU-adaptive, N=at most every Nth frame |
 | `--masks` | `false` | Save per-class mask PNGs |
 
 ## Prompt Types

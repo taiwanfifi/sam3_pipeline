@@ -101,18 +101,17 @@ docker exec william_tensorrt python3 \
   --output /root/VisionDSL/models/sam3_pipeline/outputs
 ```
 
-**偵測影片：**
+**偵測影片（自適應即時模式）：**
 
 ```bash
 docker exec william_tensorrt python3 \
   /root/VisionDSL/models/sam3_pipeline/infer.py \
   --config /root/VisionDSL/models/sam3_pipeline/config.json \
   --video /root/VisionDSL/models/sam3_pipeline/Inputs/media1.mp4 \
-  --output /root/VisionDSL/models/sam3_pipeline/outputs \
-  --interval 30
+  --output /root/VisionDSL/models/sam3_pipeline/outputs
 ```
 
-`--interval 30` 表示每 30 幀取一幀處理（節省時間和儲存空間）。
+影片模式模擬即時播放：每次 inference 完成後，影片時鐘推進實際耗時。GPU 忙碌時到達的幀會被丟棄（drop），就像真實的 camera feed。輸出的 AVI 播放時長 = 原片時長，零飄移。
 
 ## 輸出檔案說明
 
@@ -144,7 +143,7 @@ docker exec william_tensorrt python3 \
 | `--video` | — | 影片路徑 |
 | `--output` | `outputs` | 輸出目錄 |
 | `--conf` | config 裡的值 | 覆蓋信心值門檻 |
-| `--interval` | `1` | 每 N 幀處理一幀（影片模式） |
+| `--interval` | `1` | 最小幀間距；1=GPU 自適應，N=最多每 N 幀處理一幀 |
 | `--masks` | 否 | 儲存每個類別的 mask PNG |
 
 ## Prompt 類型詳解
