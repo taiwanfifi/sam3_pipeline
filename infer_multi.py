@@ -9,13 +9,27 @@ SAM3 Multi-Camera Inference Pipeline (Plan C v3)
   - Selective mask copy: only transfer detected masks (~40x less bandwidth)
   - Double-buffered decoder output: decoder N+1 overlaps mask copy N
 
+Resolution and QUERIES are auto-detected from engine files — supports
+1008, 840, or any resolution built with the same patch_size=14 ViT.
+
 Usage (inside sam3_trt container):
+  # Single video duplicated across 8 cameras
   python3 infer_multi.py --config config.json \
     --video Inputs/media1.mp4 --cameras 8 --output outputs
+
+  # Multiple videos cycled across cameras
+  python3 infer_multi.py --config config.json \
+    --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
+    --cameras 8 --output outputs
+
+  # With grid video output for visual review
+  python3 infer_multi.py --config config.json \
+    --video Inputs/media1.mp4 --cameras 8 --save-video
 """
 import cv2
 import json
 import time
+import shutil
 import argparse
 import numpy as np
 from datetime import datetime
@@ -28,19 +42,10 @@ import pycuda.autoinit
 LOG = trt.Logger(trt.Logger.WARNING)
 MAX_CAMERAS = 8
 MAX_CLASSES = 8
-IMAGE_SIZE = 1008
+PATCH_SIZE = 14
 
-FPN_SHAPES_SINGLE = [
-    (256, 288, 288),
-    (256, 144, 144),
-    (256, 72, 72),
-    (256, 72, 72),
-]
 FPN_NAMES = ["fpn_feat_0", "fpn_feat_1", "fpn_feat_2", "fpn_pos_2"]
 OUT_NAMES = ["pred_masks", "pred_boxes", "pred_logits", "presence_logits"]
-
-MASK_H, MASK_W = 288, 288
-MASK_BYTES = MASK_H * MASK_W * 4
 
 # Max detections per class iteration across all frames
 # 8 frames × ~30 dets/frame worst case = 240
@@ -129,6 +134,25 @@ class MultiCameraPipeline:
         self.vision_engine = load_engine(str(engine_dir / "vision-encoder.engine"))
         self.vision_ctx = self.vision_engine.create_execution_context()
 
+        # Probe IMAGE_SIZE from VE engine profile (supports 1008, 840, etc.)
+        ve_min = self.vision_engine.get_tensor_profile_shape("images", 0)[0]
+        IMAGE_SIZE = ve_min[2]
+        self.IMAGE_SIZE = IMAGE_SIZE
+        patches = IMAGE_SIZE // PATCH_SIZE
+        MASK_H = patches * 4
+        MASK_W = patches * 4
+        self.MASK_H = MASK_H
+        self.MASK_W = MASK_W
+        self.MASK_BYTES = MASK_H * MASK_W * 4
+        FPN_SHAPES_SINGLE = [
+            (256, patches * 4, patches * 4),
+            (256, patches * 2, patches * 2),
+            (256, patches, patches),
+            (256, patches, patches),
+        ]
+        self.FPN_SHAPES_SINGLE = FPN_SHAPES_SINGLE
+        print(f"  Resolution: {IMAGE_SIZE}x{IMAGE_SIZE} (auto-detected)")
+
         img_elems = F * 3 * IMAGE_SIZE * IMAGE_SIZE
         self.img_host = cuda.pagelocked_empty(img_elems, np.float32)
         self.img_gpu = cuda.mem_alloc(img_elems * 4)
@@ -144,10 +168,10 @@ class MultiCameraPipeline:
         self.decoder_ctx = self.decoder_engine.create_execution_context()
 
         # Probe QUERIES from decoder output shape (50 or 200 depending on engine)
-        self.decoder_ctx.set_input_shape("fpn_feat_0", (1, 256, 288, 288))
-        self.decoder_ctx.set_input_shape("fpn_feat_1", (1, 256, 144, 144))
-        self.decoder_ctx.set_input_shape("fpn_feat_2", (1, 256, 72, 72))
-        self.decoder_ctx.set_input_shape("fpn_pos_2", (1, 256, 72, 72))
+        self.decoder_ctx.set_input_shape("fpn_feat_0", (1, 256, MASK_H, MASK_W))
+        self.decoder_ctx.set_input_shape("fpn_feat_1", (1, 256, patches*2, patches*2))
+        self.decoder_ctx.set_input_shape("fpn_feat_2", (1, 256, patches, patches))
+        self.decoder_ctx.set_input_shape("fpn_pos_2", (1, 256, patches, patches))
         self.decoder_ctx.set_input_shape("prompt_features", (1, 1, 256))
         self.decoder_ctx.set_input_shape("prompt_mask", (1, 1))
         Q = self.decoder_ctx.get_tensor_shape("pred_boxes")[1]
@@ -204,6 +228,7 @@ class MultiCameraPipeline:
 
     def _preprocess_frames(self, frames):
         """Preprocess F frames into img_host using cv2."""
+        IMAGE_SIZE = self.IMAGE_SIZE
         for i, fr in enumerate(frames):
             rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
             resized = cv2.resize(rgb, (IMAGE_SIZE, IMAGE_SIZE),
@@ -222,7 +247,7 @@ class MultiCameraPipeline:
 
         # FPN: zero-copy from VE output
         for i, name in enumerate(FPN_NAMES):
-            self.decoder_ctx.set_input_shape(name, (F, *FPN_SHAPES_SINGLE[i]))
+            self.decoder_ctx.set_input_shape(name, (F, *self.FPN_SHAPES_SINGLE[i]))
             self.decoder_ctx.set_tensor_address(name, self.fpn_gpu[i])
 
         # Prompt: pre-replicated, just set pointer
@@ -245,6 +270,8 @@ class MultiCameraPipeline:
                               all_dets):
         """Transfer boxes/logits + selective masks, then postprocess."""
         F, Q = self.F, self.Q
+        MASK_H, MASK_W = self.MASK_H, self.MASK_W
+        MASK_BYTES = self.MASK_BYTES
         gpu = self.out_gpu[buf_idx]
         host = self.out_host[buf_idx]
 
@@ -323,7 +350,7 @@ class MultiCameraPipeline:
         """Full pipeline with double-buffered decoder + selective mask copy.
 
         Timeline (4 classes):
-          stream_compute: [VE] [Dec0→buf0] [Dec1→buf1] [Dec2→buf0] [Dec3→buf1]
+          stream_compute: [VE] [Dec0->buf0] [Dec1->buf1] [Dec2->buf0] [Dec3->buf1]
           stream_copy:          [copy buf0]  [copy buf1] [copy buf0] [copy buf1]
           CPU:                  [process 0]  [process 1] [process 2] [process 3]
 
@@ -332,10 +359,11 @@ class MultiCameraPipeline:
         if conf is None:
             conf = self.confidence
         F = self.F
+        IMAGE_SIZE = self.IMAGE_SIZE
         hws = [fr.shape[:2] for fr in frames]
         all_dets = [[] for _ in range(F)]
 
-        # 1. Preprocess all F frames → GPU
+        # 1. Preprocess all F frames -> GPU
         self._preprocess_frames(frames)
 
         # 2. Vision encoder batch=F
@@ -426,6 +454,25 @@ def draw_overlay(image_bgr, dets, alpha=0.45):
     return vis
 
 
+def compose_grid(frames, all_dets, cam_labels, F, cols, cell_w, cell_h):
+    """Compose all camera overlays into a single grid image."""
+    rows = (F + cols - 1) // cols
+    grid = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
+    for fi in range(F):
+        overlay = draw_overlay(frames[fi], all_dets[fi])
+        cell = cv2.resize(overlay, (cell_w, cell_h))
+        # Camera label with shadow
+        label = f"[{fi}] {cam_labels[fi]}"
+        cv2.putText(cell, label, (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+        cv2.putText(cell, label, (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 1)
+        r, c = divmod(fi, cols)
+        grid[r * cell_h:(r + 1) * cell_h,
+             c * cell_w:(c + 1) * cell_w] = cell
+    return grid
+
+
 def run_tag():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -434,13 +481,18 @@ def run_tag():
 # Video mode
 # ---------------------------------------------------------------------------
 
-def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag):
+def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag,
+                    save_video=False):
     """Multi-camera video inference with real different video sources.
 
     Each video_path gets its own cv2.VideoCapture.  If fewer videos than
     cameras, videos are cycled to fill all F slots.  The master clock is
     driven by the first video; when any camera's video ends it loops from
     the beginning.
+
+    When save_video=True, produces a grid overlay video (2x4 layout) for
+    visual review. This adds overlay rendering overhead and is not intended
+    for benchmarking -- run without --save-video for pure speed tests.
     """
     F = pipe.F
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -469,7 +521,18 @@ def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag):
     print(f"Cameras: {F} ({len(unique_vids)} unique videos, cycled)")
     for i, label in enumerate(cam_labels):
         print(f"  cam[{i}]: {label}")
-    print(f"Master clock: {total} frames, {src_fps:.1f} fps, {duration:.1f}s\n")
+    print(f"Master clock: {total} frames, {src_fps:.1f} fps, {duration:.1f}s")
+    if save_video:
+        print("Grid video output: ENABLED")
+    print()
+
+    # Grid video setup
+    if save_video:
+        CELL_W, CELL_H = 480, 270
+        cols = min(F, 4)
+        grid_w, grid_h = cols * CELL_W, (F + cols - 1) // cols * CELL_H
+        tmp = out_dir / f".tmp_{tag}"
+        tmp.mkdir(exist_ok=True)
 
     video_clock = 0.0
     next_idx = 0
@@ -517,6 +580,12 @@ def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag):
             print(f"#{frame_idx}: {dt*1000:.0f} ms total ({per_cam:.0f} ms/cam), "
                   f"{total_dets} dets [{det_str}]")
 
+            # Save grid overlay frame
+            if save_video:
+                grid = compose_grid(frames, all_dets, cam_labels,
+                                    F, cols, CELL_W, CELL_H)
+                cv2.imwrite(str(tmp / f"{n_out:06d}.jpg"), grid)
+
             row = {
                 "frame_idx": frame_idx,
                 "elapsed_ms": round(dt * 1000, 1),
@@ -539,6 +608,22 @@ def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag):
     for cap in caps:
         cap.release()
     print(f"\nProcessed {n_out}/{total} master frames")
+
+    # Phase 2: combine grid overlay frames -> AVI
+    if save_video and n_out > 0:
+        avi = out_dir / f"{tag}_grid.avi"
+        actual_fps = max(1.0, n_out / duration)
+        print(f"Combining grid AVI @ {actual_fps:.1f} fps ...")
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        writer = cv2.VideoWriter(str(avi), fourcc, actual_fps,
+                                 (grid_w, grid_h))
+        for i in range(n_out):
+            img = cv2.imread(str(tmp / f"{i:06d}.jpg"))
+            writer.write(img)
+        writer.release()
+        shutil.rmtree(tmp, ignore_errors=True)
+        print(f"Grid video: {avi.name}")
+
     return times
 
 
@@ -560,6 +645,7 @@ def write_performance(times, out_dir, pipe, tag, video_paths=None):
         "video_sources": [Path(p).name for p in video_paths] if video_paths else [],
         "classes": pipe.N,
         "queries": pipe.Q,
+        "image_size": pipe.IMAGE_SIZE,
         "prompt_len": pipe.P,
         "frames_processed": len(times),
         "total_avg_ms": round(avg, 1),
@@ -597,6 +683,10 @@ def main():
     ap.add_argument("--output", default="outputs")
     ap.add_argument("--conf", type=float, default=None)
     ap.add_argument("--interval", type=int, default=1)
+    ap.add_argument("--save-video", action="store_true",
+                    help="Save grid overlay video (2x4 layout) for visual "
+                         "review. Adds rendering overhead -- omit for speed "
+                         "benchmarks.")
     args = ap.parse_args()
 
     out = Path(args.output)
@@ -604,7 +694,8 @@ def main():
     conf = args.conf if args.conf is not None else pipe.confidence
     tag = run_tag()
 
-    times = run_multi_video(pipe, args.video, out, conf, args.interval, tag)
+    times = run_multi_video(pipe, args.video, out, conf, args.interval, tag,
+                            save_video=args.save_video)
     write_performance(times, out, pipe, tag, video_paths=args.video)
 
 

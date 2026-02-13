@@ -209,7 +209,9 @@ Q50 saves ~1.2 GB VRAM with zero speed/quality loss. See [`optimize.md`](optimiz
 
 ## Multi-Camera Mode (`infer_multi.py`)
 
-For processing multiple camera feeds simultaneously (Plan C v3 architecture):
+For processing multiple camera feeds simultaneously (Plan C v3 architecture).
+
+**Single video (duplicated across all cameras):**
 
 ```bash
 docker exec william_tensorrt python3 \
@@ -220,21 +222,53 @@ docker exec william_tensorrt python3 \
   --output /root/VisionDSL/models/sam3_pipeline/outputs
 ```
 
+**Multiple videos (cycled to fill camera slots):**
+
+```bash
+# 3 videos → 8 cameras: shop,hair,car,shop,hair,car,shop,hair
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
+  --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
+  --cameras 8
+
+# 8 unique videos (production scenario)
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
+  --video cam1.mp4 cam2.mp4 cam3.mp4 cam4.mp4 cam5.mp4 cam6.mp4 cam7.mp4 cam8.mp4 \
+  --cameras 8
+```
+
+**With grid overlay video (for visual review):**
+
+```bash
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
+  --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
+  --cameras 8 --save-video
+```
+
+This produces a 2x4 grid AVI (`{timestamp}_grid.avi`) with all 8 camera overlays side by side. Slower than detection-only mode — use without `--save-video` for benchmarking.
+
 Key optimisations:
 - **VE batch=F**: all camera frames in one vision encoder pass
 - **Zero-copy FPN**: VE output buffers directly used as decoder input
 - **Decoder iterates per class**: each with batch=F (all frames)
 - **Double-buffered decoder output**: decoder N+1 overlaps mask copy N
 - **Selective mask copy**: only transfer masks for detected objects (~40x less PCIe bandwidth)
+- **Auto-detection**: IMAGE_SIZE and QUERIES read from engine files — no manual config
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config` | (required) | Path to config.json |
-| `--video` | (required) | Video file path |
-| `--cameras` | `8` | Number of simulated cameras |
+| `--video` | (required) | Video file(s); cycled if fewer than `--cameras` |
+| `--cameras` | `8` | Number of camera slots |
 | `--output` | `outputs` | Output directory |
 | `--conf` | from config | Confidence threshold override |
 | `--interval` | `1` | Min frame gap |
+| `--save-video` | `false` | Save 2x4 grid overlay AVI for visual review |
 
 ## Two-Step Workflow
 

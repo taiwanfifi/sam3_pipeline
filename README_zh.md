@@ -227,7 +227,9 @@ Q50 省了 ~1.2 GB VRAM，速度和品質零損失。完整分析見 [`optimize.
 
 ## 多攝影機模式（`infer_multi.py`）
 
-同時處理多路攝影機畫面（Plan C v3 架構）：
+同時處理多路攝影機畫面（Plan C v3 架構）。
+
+**單一影片（複製到所有攝影機）：**
 
 ```bash
 docker exec william_tensorrt python3 \
@@ -238,21 +240,53 @@ docker exec william_tensorrt python3 \
   --output /root/VisionDSL/models/sam3_pipeline/outputs
 ```
 
+**多支影片（自動循環填滿攝影機插槽）：**
+
+```bash
+# 3 支影片 → 8 路攝影機：shop,hair,car,shop,hair,car,shop,hair
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
+  --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
+  --cameras 8
+
+# 到時 8 支不同影片直接列出
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
+  --video cam1.mp4 cam2.mp4 cam3.mp4 cam4.mp4 cam5.mp4 cam6.mp4 cam7.mp4 cam8.mp4 \
+  --cameras 8
+```
+
+**輸出偵測影片（視覺檢視用）：**
+
+```bash
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
+  --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
+  --cameras 8 --save-video
+```
+
+加上 `--save-video` 會產生 2×4 格子畫面的 AVI 影片（`{timestamp}_grid.avi`），可以一次看到 8 路偵測結果。因為多了 overlay 渲染，速度會比純偵測慢 — 跑 benchmark 請不要加此參數。
+
 核心優化：
 - **VE batch=F**：所有攝影機畫面一次跑完 vision encoder
 - **零拷貝 FPN**：VE output buffer 直接作為 decoder input
 - **Decoder 迭代 class**：每個 class 用 batch=F（所有畫面）
 - **Double-buffered output**：decoder N+1 和 mask copy N 重疊執行
 - **選擇性 mask 複製**：只傳輸有偵測到的 mask（~40 倍 PCIe 頻寬節省）
+- **自動偵測**：IMAGE_SIZE 和 QUERIES 從引擎檔案讀取，不需手動設定
 
 | 參數 | 預設值 | 說明 |
 |------|--------|------|
 | `--config` | （必填） | config.json 路徑 |
-| `--video` | （必填） | 影片路徑 |
-| `--cameras` | `8` | 模擬攝影機數量 |
+| `--video` | （必填） | 影片路徑（可多個，不足時自動循環填滿） |
+| `--cameras` | `8` | 攝影機數量 |
 | `--output` | `outputs` | 輸出目錄 |
 | `--conf` | config 裡的值 | 覆蓋信心值門檻 |
 | `--interval` | `1` | 最小幀間距 |
+| `--save-video` | `false` | 輸出 2×4 格子畫面偵測影片 |
 
 ## 整體流程圖
 

@@ -36,7 +36,67 @@ import torchvision
 
 # transformers 是 HuggingFace 的模型庫，提供 SAM3 的 PyTorch 實作
 from transformers.masking_utils import create_bidirectional_mask
-from transformers.models.sam3.modeling_sam3 import Sam3Model
+from transformers.models.sam3.modeling_sam3 import Sam3Model, Sam3ViTRotaryEmbedding
+
+
+# ---------------------------------------------------------------------------
+# RoPE 解析度修補 — 讓 Vision Encoder 支援非原始解析度匯出
+# ---------------------------------------------------------------------------
+
+def patch_rope_for_resolution(model: Sam3Model, target_image_size: int):
+    """
+    修補 ViT 全域注意力層的旋轉位置編碼 (RoPE)，使其匹配目標解析度。
+
+    SAM3 的 ViT backbone 有 32 層：
+      - 28 個 windowed 層使用固定 24×24 窗口 → RoPE = [576, 64]（不受影響）
+      - 4 個 global 層 (7, 15, 23, 31) 使用完整 patch grid → RoPE = [patches², 64]
+
+    原始模型的 global RoPE 為 72×72 = 5184 位置（對應 1008×1008 解析度）。
+    如果目標解析度不同（如 840×840 → 60×60 = 3600 位置），
+    直接推論會因維度不匹配而報錯。
+
+    此函式在模型載入後、ONNX 匯出前，用目標解析度重新計算 global 層的 RoPE buffer。
+    Windowed 層和所有模型權重完全不動。
+
+    當 target_image_size 等於原始解析度時，此函式不做任何修改。
+    """
+    backbone = model.vision_encoder.backbone
+    config = backbone.config
+
+    original_image_size = config.image_size  # 通常是 1008
+    patch_size = config.patch_size            # 14
+
+    original_patches = original_image_size // patch_size
+    target_patches = target_image_size // patch_size
+
+    if target_patches == original_patches:
+        return  # 解析度相同，不需要修補
+
+    print(f"  RoPE 修補: {original_patches}×{original_patches} → {target_patches}×{target_patches} "
+          f"(global 層: {config.global_attn_indexes})")
+
+    window_size = config.window_size  # 24
+
+    for layer_idx in config.global_attn_indexes:
+        layer = backbone.layers[layer_idx]
+        # global 層的 window_size == 0 → RoPE 覆蓋整個 patch grid
+        # scale = window_size / patches（正規化位置到窗口相對座標）
+        scale = window_size / target_patches
+        new_rope = Sam3ViTRotaryEmbedding(
+            config,
+            end_x=target_patches,
+            end_y=target_patches,
+            scale=scale,
+        )
+        # 搬到與原始 RoPE 相同的裝置
+        device = layer.rotary_emb.rope_embeddings_cos.device
+        new_rope = new_rope.to(device)
+        layer.rotary_emb = new_rope
+
+    old_positions = original_patches * original_patches
+    new_positions = target_patches * target_patches
+    print(f"  RoPE 修補完成: {old_positions} → {new_positions} 位置 "
+          f"(4 個 global 層已更新)")
 
 
 # ---------------------------------------------------------------------------
@@ -619,19 +679,20 @@ def export_text_encoder(
 
 def export_geometry_encoder(
     model: Sam3Model, output_dir: Path,
-    device: str, opset_version: int,
+    device: str, opset_version: int, image_size: int = 1008,
 ):
     """匯出 Geometry Encoder 為 ONNX（動態 batch + 動態框數量）"""
-    print("匯出 Geometry Encoder...")
+    patches = image_size // 14  # ViT patch size
+    print(f"匯出 Geometry Encoder (fpn={patches}x{patches})...")
     wrapper = GeometryEncoderWrapper(model).to(device).eval()
 
     torch.onnx.export(
         wrapper,
         (
-            torch.rand(1, 5, 4, device=device),               # 5 個框（示範用）
-            torch.ones(1, 5, dtype=torch.long, device=device), # 全部標記為正樣本
-            torch.randn(1, 256, 72, 72, device=device),        # FPN 特徵
-            torch.randn(1, 256, 72, 72, device=device),        # 位置編碼
+            torch.rand(1, 5, 4, device=device),                          # 5 個框（示範用）
+            torch.ones(1, 5, dtype=torch.long, device=device),           # 全部標記為正樣本
+            torch.randn(1, 256, patches, patches, device=device),        # FPN 特徵
+            torch.randn(1, 256, patches, patches, device=device),        # 位置編碼
         ),
         str(output_dir / "geometry-encoder.onnx"),
         input_names=["input_boxes", "input_boxes_labels", "fpn_feat_2", "fpn_pos_2"],
@@ -655,7 +716,7 @@ def export_geometry_encoder(
 def export_decoder(
     model: Sam3Model, output_dir: Path,
     device: str, opset_version: int,
-    num_queries: int = 200,
+    num_queries: int = 200, image_size: int = 1008,
 ):
     """匯出 Decoder 為 ONNX（動態 batch + 動態 prompt 長度）
 
@@ -664,20 +725,26 @@ def export_decoder(
             設為較小的值（如 50）可以大幅節省 VRAM：
             - DETR 內部仍使用全部 200 queries（不影響偵測品質）
             - 在 mask decoder 之前做 top-K 篩選
-            - mask decoder 只處理 K 個候選 → output [B, K, 288, 288]
+            - mask decoder 只處理 K 個候選 → output [B, K, fpn0, fpn0]
             - VRAM 節省與 K 成正比：200→50 = mask buffer 減 75%
+        image_size: 輸入圖片解析度（影響 FPN 特徵圖大小）。
+            patches = image_size / 14，FPN 尺寸 = patches*4, patches*2, patches。
     """
     Q = num_queries
-    print(f"匯出 Decoder (num_queries={Q})...")
+    patches = image_size // 14
+    fpn0 = patches * 4   # e.g. 288 for 1008, 240 for 840
+    fpn1 = patches * 2   # e.g. 144 for 1008, 120 for 840
+    fpn2 = patches        # e.g. 72 for 1008, 60 for 840
+    print(f"匯出 Decoder (num_queries={Q}, fpn={fpn0}/{fpn1}/{fpn2})...")
     wrapper = DecoderWrapper(model, num_queries=Q).to(device).eval()
 
     torch.onnx.export(
         wrapper,
         (
-            torch.randn(1, 256, 288, 288, device=device),  # fpn_feat_0
-            torch.randn(1, 256, 144, 144, device=device),  # fpn_feat_1
-            torch.randn(1, 256,  72,  72, device=device),  # fpn_feat_2
-            torch.randn(1, 256,  72,  72, device=device),  # fpn_pos_2
+            torch.randn(1, 256, fpn0, fpn0, device=device),  # fpn_feat_0
+            torch.randn(1, 256, fpn1, fpn1, device=device),  # fpn_feat_1
+            torch.randn(1, 256, fpn2, fpn2, device=device),  # fpn_feat_2
+            torch.randn(1, 256, fpn2, fpn2, device=device),  # fpn_pos_2
             torch.randn(1,  32, 256, device=device),        # prompt_features
             torch.ones(1, 32, dtype=torch.bool, device=device),  # prompt_mask
         ),
@@ -745,7 +812,11 @@ def main():
 
     print(f"載入 SAM3 模型: {args.model_path} ...")
     model = Sam3Model.from_pretrained(args.model_path).to(args.device).eval()
-    print("  OK\n")
+    print("  OK")
+
+    # 如果目標解析度與模型預設不同，修補 global attention 層的 RoPE
+    patch_rope_for_resolution(model, args.image_size)
+    print()
 
     # 每個匯出函式只接收自己需要的參數
     common = dict(model=model, output_dir=output_dir,
@@ -754,8 +825,8 @@ def main():
     exporters = {
         "vision":   lambda: export_vision_encoder(**common, image_size=args.image_size),
         "text":     lambda: export_text_encoder(**common),
-        "geometry": lambda: export_geometry_encoder(**common),
-        "decoder":  lambda: export_decoder(**common, num_queries=args.num_queries),
+        "geometry": lambda: export_geometry_encoder(**common, image_size=args.image_size),
+        "decoder":  lambda: export_decoder(**common, num_queries=args.num_queries, image_size=args.image_size),
     }
 
     modules = list(exporters.keys()) if args.all else [args.module]

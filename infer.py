@@ -34,19 +34,10 @@ import pycuda.autoinit
 
 LOG = trt.Logger(trt.Logger.WARNING)
 MAX_CLASSES = 8
-IMAGE_SIZE = 1008
+PATCH_SIZE = 14
 
-FPN_SHAPES = [
-    (1, 256, 288, 288),
-    (1, 256, 144, 144),
-    (1, 256, 72, 72),
-    (1, 256, 72, 72),
-]
 FPN_NAMES = ["fpn_feat_0", "fpn_feat_1", "fpn_feat_2", "fpn_pos_2"]
 OUT_NAMES = ["pred_masks", "pred_boxes", "pred_logits", "presence_logits"]
-
-MASK_H, MASK_W = 288, 288
-MASK_BYTES = MASK_H * MASK_W * 4
 
 
 def load_engine(path: str):
@@ -105,6 +96,25 @@ class Pipeline:
         self.vision_engine = load_engine(str(engine_dir / "vision-encoder.engine"))
         self.vision_ctx = self.vision_engine.create_execution_context()
 
+        # Probe IMAGE_SIZE from VE engine profile (supports 1008, 840, etc.)
+        ve_min = self.vision_engine.get_tensor_profile_shape("images", 0)[0]
+        IMAGE_SIZE = ve_min[2]
+        self.IMAGE_SIZE = IMAGE_SIZE
+        patches = IMAGE_SIZE // PATCH_SIZE
+        MASK_H = patches * 4
+        MASK_W = patches * 4
+        self.MASK_H = MASK_H
+        self.MASK_W = MASK_W
+        self.MASK_BYTES = MASK_H * MASK_W * 4
+        FPN_SHAPES = [
+            (1, 256, patches * 4, patches * 4),
+            (1, 256, patches * 2, patches * 2),
+            (1, 256, patches, patches),
+            (1, 256, patches, patches),
+        ]
+        self.FPN_SHAPES = FPN_SHAPES
+        print(f"  Resolution: {IMAGE_SIZE}x{IMAGE_SIZE} (auto-detected)")
+
         img_elems = 3 * IMAGE_SIZE * IMAGE_SIZE
         self.img_host = cuda.pagelocked_empty(img_elems, np.float32)
         self.img_gpu = cuda.mem_alloc(self.img_host.nbytes)
@@ -116,10 +126,10 @@ class Pipeline:
         self.decoder_ctx = self.decoder_engine.create_execution_context()
 
         # Probe QUERIES from decoder output shape (50 or 200 depending on engine)
-        self.decoder_ctx.set_input_shape("fpn_feat_0", (1, 256, 288, 288))
-        self.decoder_ctx.set_input_shape("fpn_feat_1", (1, 256, 144, 144))
-        self.decoder_ctx.set_input_shape("fpn_feat_2", (1, 256, 72, 72))
-        self.decoder_ctx.set_input_shape("fpn_pos_2", (1, 256, 72, 72))
+        self.decoder_ctx.set_input_shape("fpn_feat_0", (1, 256, MASK_H, MASK_W))
+        self.decoder_ctx.set_input_shape("fpn_feat_1", (1, 256, patches*2, patches*2))
+        self.decoder_ctx.set_input_shape("fpn_feat_2", (1, 256, patches, patches))
+        self.decoder_ctx.set_input_shape("fpn_pos_2", (1, 256, patches, patches))
         self.decoder_ctx.set_input_shape("prompt_features", (1, 1, 256))
         self.decoder_ctx.set_input_shape("prompt_mask", (1, 1))
         Q = self.decoder_ctx.get_tensor_shape("pred_boxes")[1]
@@ -146,23 +156,23 @@ class Pipeline:
 
         # Output buffers
         self.out_shapes = [
-            (N, Q, MASK_H, MASK_W),  # pred_masks
-            (N, Q, 4),               # pred_boxes
-            (N, Q),                   # pred_logits
-            (N, 1),                   # presence_logits
+            (N, Q, self.MASK_H, self.MASK_W),  # pred_masks
+            (N, Q, 4),                          # pred_boxes
+            (N, Q),                              # pred_logits
+            (N, 1),                              # presence_logits
         ]
         self.out_gpu = [cuda.mem_alloc(int(np.prod(s)) * 4) for s in self.out_shapes]
         self.out_host = [
             cuda.pagelocked_empty(int(np.prod(s)), np.float32) for s in self.out_shapes[1:]
         ]
-        self.mask_host = cuda.pagelocked_empty(MASK_H * MASK_W, np.float32)
+        self.mask_host = cuda.pagelocked_empty(self.MASK_H * self.MASK_W, np.float32)
 
         self.stream.synchronize()
         del pf_host, pm_host
 
         # VRAM estimate (GPU allocations only)
         vram = img_elems * 4  # img_gpu
-        for s in FPN_SHAPES:
+        for s in self.FPN_SHAPES:
             vram += int(np.prod(s)) * 4      # single FPN
             vram += N * int(np.prod(s)) * 4  # batched FPN
         vram += pf_bytes + pm_bytes
@@ -181,6 +191,7 @@ class Pipeline:
         N, P = self.N, self.P
 
         # Preprocess
+        IMAGE_SIZE = self.IMAGE_SIZE
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         resized = np.array(PILImage.fromarray(rgb).resize(
             (IMAGE_SIZE, IMAGE_SIZE), PILImage.BILINEAR))
@@ -197,7 +208,7 @@ class Pipeline:
 
         # Replicate FPN on GPU (d2d copy, zero CPU involvement)
         for fi in range(4):
-            one = int(np.prod(FPN_SHAPES[fi])) * 4
+            one = int(np.prod(self.FPN_SHAPES[fi])) * 4
             cuda.memcpy_dtod_async(self.batch_fpn_gpu[fi], self.fpn_gpu[fi], one, self.stream)
             for bi in range(1, N):
                 cuda.memcpy_dtod_async(
@@ -206,7 +217,7 @@ class Pipeline:
 
         # Decoder: batch=N, prompt_len=P
         for i, name in enumerate(FPN_NAMES):
-            self.decoder_ctx.set_input_shape(name, (N, *FPN_SHAPES[i][1:]))
+            self.decoder_ctx.set_input_shape(name, (N, *self.FPN_SHAPES[i][1:]))
             self.decoder_ctx.set_tensor_address(name, self.batch_fpn_gpu[i])
         self.decoder_ctx.set_input_shape("prompt_features", (N, P, 256))
         self.decoder_ctx.set_tensor_address("prompt_features", self.prompt_feat_gpu)
@@ -233,11 +244,11 @@ class Pipeline:
         return boxes, logits, presence, hw
 
     def copy_mask(self, cls_idx: int, query_idx: int, hw: tuple) -> np.ndarray:
-        """Selectively copy one mask from GPU → CPU, resize to original res."""
+        """Selectively copy one mask from GPU -> CPU, resize to original res."""
         h, w = hw
-        offset = (cls_idx * self.Q + query_idx) * MASK_BYTES
+        offset = (cls_idx * self.Q + query_idx) * self.MASK_BYTES
         cuda.memcpy_dtoh(self.mask_host, int(self.out_gpu[0]) + offset)
-        raw = self.mask_host.reshape(MASK_H, MASK_W)
+        raw = self.mask_host.reshape(self.MASK_H, self.MASK_W)
         return cv2.resize(raw, (w, h), interpolation=cv2.INTER_LINEAR) > 0
 
     def postprocess(self, boxes, logits, presence, hw, conf=None):
