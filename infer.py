@@ -47,7 +47,6 @@ OUT_NAMES = ["pred_masks", "pred_boxes", "pred_logits", "presence_logits"]
 
 MASK_H, MASK_W = 288, 288
 MASK_BYTES = MASK_H * MASK_W * 4
-QUERIES = 200
 
 
 def load_engine(path: str):
@@ -116,6 +115,17 @@ class Pipeline:
         self.decoder_engine = load_engine(str(engine_dir / "decoder.engine"))
         self.decoder_ctx = self.decoder_engine.create_execution_context()
 
+        # Probe QUERIES from decoder output shape (50 or 200 depending on engine)
+        self.decoder_ctx.set_input_shape("fpn_feat_0", (1, 256, 288, 288))
+        self.decoder_ctx.set_input_shape("fpn_feat_1", (1, 256, 144, 144))
+        self.decoder_ctx.set_input_shape("fpn_feat_2", (1, 256, 72, 72))
+        self.decoder_ctx.set_input_shape("fpn_pos_2", (1, 256, 72, 72))
+        self.decoder_ctx.set_input_shape("prompt_features", (1, 1, 256))
+        self.decoder_ctx.set_input_shape("prompt_mask", (1, 1))
+        Q = self.decoder_ctx.get_tensor_shape("pred_boxes")[1]
+        self.Q = Q
+        print(f"  Decoder QUERIES={Q} (auto-detected from engine)")
+
         # Batched FPN buffers (N copies)
         self.batch_fpn_gpu = [cuda.mem_alloc(N * int(np.prod(s)) * 4) for s in FPN_SHAPES]
 
@@ -136,10 +146,10 @@ class Pipeline:
 
         # Output buffers
         self.out_shapes = [
-            (N, QUERIES, MASK_H, MASK_W),  # pred_masks
-            (N, QUERIES, 4),                # pred_boxes
-            (N, QUERIES),                   # pred_logits
-            (N, 1),                         # presence_logits
+            (N, Q, MASK_H, MASK_W),  # pred_masks
+            (N, Q, 4),               # pred_boxes
+            (N, Q),                   # pred_logits
+            (N, 1),                   # presence_logits
         ]
         self.out_gpu = [cuda.mem_alloc(int(np.prod(s)) * 4) for s in self.out_shapes]
         self.out_host = [
@@ -216,15 +226,16 @@ class Pipeline:
 
         self.stream.synchronize()
 
-        boxes    = self.out_host[0][:N*QUERIES*4].reshape(N, QUERIES, 4)
-        logits   = self.out_host[1][:N*QUERIES].reshape(N, QUERIES)
+        Q = self.Q
+        boxes    = self.out_host[0][:N*Q*4].reshape(N, Q, 4)
+        logits   = self.out_host[1][:N*Q].reshape(N, Q)
         presence = self.out_host[2][:N].reshape(N, 1)
         return boxes, logits, presence, hw
 
     def copy_mask(self, cls_idx: int, query_idx: int, hw: tuple) -> np.ndarray:
         """Selectively copy one mask from GPU → CPU, resize to original res."""
         h, w = hw
-        offset = (cls_idx * QUERIES + query_idx) * MASK_BYTES
+        offset = (cls_idx * self.Q + query_idx) * MASK_BYTES
         cuda.memcpy_dtoh(self.mask_host, int(self.out_gpu[0]) + offset)
         raw = self.mask_host.reshape(MASK_H, MASK_W)
         return cv2.resize(raw, (w, h), interpolation=cv2.INTER_LINEAR) > 0

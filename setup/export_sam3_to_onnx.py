@@ -423,11 +423,16 @@ class DecoderWrapper(nn.Module):
          - 用 200 個可學習的 query（候選框）去「詢問」編碼後的特徵
          - 每個 query 會對齊到圖片中的一個區域，輸出一個偵測候選
 
-      3. 輸出頭
-         - box_head: 預測每個 query 的偵測框 [B, 200, 4] (xyxy 格式)
-         - dot_product_scoring: 計算每個 query 與 prompt 的匹配分數 [B, 200]
+      3. Top-K 篩選（可選）
+         - 如果 num_queries < 200，從 200 個候選中依分數選出前 K 個
+         - 只對前 K 個產生遮罩 → 大幅節省 VRAM 和運算量
+         - DETR 內部仍用完整 200 queries，不影響偵測品質
+
+      4. 輸出頭
+         - box_head: 預測偵測框 [B, K, 4] (xyxy 格式)
+         - dot_product_scoring: 計算匹配分數 [B, K]
          - presence_logits: 判斷「畫面中是否存在目標物」 [B, 1]
-         - mask_decoder: 產生像素級遮罩 [B, 200, H, W]
+         - mask_decoder: 產生像素級遮罩 [B, K, H, W]
 
     輸入:
       fpn_feat_0       [B, 256, 288, 288]  — 高解析度 FPN 特徵
@@ -438,19 +443,27 @@ class DecoderWrapper(nn.Module):
       prompt_mask      [B, prompt_len]      — prompt 的有效位遮罩
 
     輸出:
-      pred_masks       [B, 200, H, W]  — 200 個候選遮罩
-      pred_boxes       [B, 200, 4]     — 200 個偵測框 (xyxy)
-      pred_logits      [B, 200]        — 200 個匹配分數
-      presence_logits  [B, 1]          — 目標是否存在的分數
+      pred_masks       [B, K, H, W]  — K 個候選遮罩（K = num_queries）
+      pred_boxes       [B, K, 4]     — K 個偵測框 (xyxy)
+      pred_logits      [B, K]        — K 個匹配分數
+      presence_logits  [B, 1]        — 目標是否存在的分數
+
+    參數:
+      num_queries: 輸出的候選數量（預設 200 = 全部，可設為 50/100 以節省 VRAM）
     """
 
-    def __init__(self, sam3_model: Sam3Model):
+    def __init__(self, sam3_model: Sam3Model, num_queries: int = 200):
         super().__init__()
         self.detr_encoder = sam3_model.detr_encoder      # 6 層 encoder
         self.detr_decoder = sam3_model.detr_decoder      # 6 層 decoder + 200 queries
         self.mask_decoder = sam3_model.mask_decoder       # 像素級遮罩生成
         self.dot_product_scoring = sam3_model.dot_product_scoring  # prompt 匹配分數
         self.box_head = sam3_model.detr_decoder.box_head  # 偵測框回歸
+
+        # 模型內部固定 200 queries，num_queries 控制輸出數量
+        self.model_queries = sam3_model.config.detr_decoder_config.num_queries  # 200
+        self.num_queries = min(num_queries, self.model_queries)
+        self.use_topk = self.num_queries < self.model_queries
 
     def forward(
         self,
@@ -502,8 +515,24 @@ class DecoderWrapper(nn.Module):
         decoder_hidden_states = decoder_outputs.intermediate_hidden_states[-1]
         presence_logits = decoder_outputs.presence_logits[-1]  # [B, 1]
 
+        # --- Top-K 篩選（可選） ---
+        # 從 200 個候選中選出分數最高的前 K 個，只對這些產生遮罩
+        # DETR 內部仍使用完整 200 queries，偵測品質不受影響
+        if self.use_topk:
+            K = self.num_queries
+            _, topk_indices = pred_logits.topk(K, dim=-1)           # [B, K]
+            topk_indices, _ = topk_indices.sort(dim=-1)             # 保持原始順序
+
+            # 用 gather 從 200 中挑出 top-K
+            idx_boxes = topk_indices.unsqueeze(-1).expand(-1, -1, 4)
+            pred_boxes = pred_boxes.gather(1, idx_boxes)            # [B, K, 4]
+            pred_logits = pred_logits.gather(1, topk_indices)       # [B, K]
+
+            idx_hidden = topk_indices.unsqueeze(-1).expand(-1, -1, decoder_hidden_states.shape[-1])
+            decoder_hidden_states = decoder_hidden_states.gather(1, idx_hidden)  # [B, K, 256]
+
         # --- Mask Decoder ---
-        # 從 decoder 的 query 特徵生成像素級遮罩
+        # 從 decoder 的 query 特徵生成像素級遮罩（只處理 K 個）
         mask_outputs = self.mask_decoder(
             decoder_queries=decoder_hidden_states,
             backbone_features=[fpn_feat_0, fpn_feat_1, fpn_feat_2],
@@ -626,10 +655,21 @@ def export_geometry_encoder(
 def export_decoder(
     model: Sam3Model, output_dir: Path,
     device: str, opset_version: int,
+    num_queries: int = 200,
 ):
-    """匯出 Decoder 為 ONNX（動態 batch + 動態 prompt 長度）"""
-    print("匯出 Decoder...")
-    wrapper = DecoderWrapper(model).to(device).eval()
+    """匯出 Decoder 為 ONNX（動態 batch + 動態 prompt 長度）
+
+    Args:
+        num_queries: 輸出候選數量。預設 200（全部）。
+            設為較小的值（如 50）可以大幅節省 VRAM：
+            - DETR 內部仍使用全部 200 queries（不影響偵測品質）
+            - 在 mask decoder 之前做 top-K 篩選
+            - mask decoder 只處理 K 個候選 → output [B, K, 288, 288]
+            - VRAM 節省與 K 成正比：200→50 = mask buffer 減 75%
+    """
+    Q = num_queries
+    print(f"匯出 Decoder (num_queries={Q})...")
+    wrapper = DecoderWrapper(model, num_queries=Q).to(device).eval()
 
     torch.onnx.export(
         wrapper,
@@ -662,7 +702,7 @@ def export_decoder(
             "presence_logits": {0: "batch"},
         },
     )
-    print(f"  OK: {output_dir / 'decoder.onnx'}")
+    print(f"  OK: {output_dir / 'decoder.onnx'} (queries={Q})")
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +729,12 @@ def main():
     parser.add_argument("--output-dir", default="onnx", help="ONNX 輸出資料夾")
     parser.add_argument("--device", default="cpu", help="運算裝置 (cpu / cuda)")
     parser.add_argument("--opset-version", type=int, default=17, help="ONNX opset 版本")
+    parser.add_argument(
+        "--num-queries", type=int, default=200,
+        help="Decoder 輸出候選數量（預設 200）。"
+             "設為 50 或 100 可大幅節省 VRAM，"
+             "DETR 內部仍用 200 queries 不影響偵測品質",
+    )
     args = parser.parse_args()
 
     if not args.module and not args.all:
@@ -709,7 +755,7 @@ def main():
         "vision":   lambda: export_vision_encoder(**common, image_size=args.image_size),
         "text":     lambda: export_text_encoder(**common),
         "geometry": lambda: export_geometry_encoder(**common),
-        "decoder":  lambda: export_decoder(**common),
+        "decoder":  lambda: export_decoder(**common, num_queries=args.num_queries),
     }
 
     modules = list(exporters.keys()) if args.all else [args.module]

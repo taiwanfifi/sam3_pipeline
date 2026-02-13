@@ -14,11 +14,10 @@ sam3_pipeline/
 │   ├── README.md             #   從零開始的逐步教學
 │   ├── export_sam3_to_onnx.py #  PyTorch → ONNX 匯出腳本
 │   └── onnx_to_tensorrt.sh   #  ONNX → TensorRT 引擎轉換腳本
-├── engines/                  # TensorRT 引擎 + tokenizer（完全獨立，不依賴外部路徑）
-│   ├── vision-encoder.engine
-│   ├── text-encoder.engine
-│   ├── geometry-encoder.engine
-│   ├── decoder.engine
+├── engines/                  # TensorRT 引擎（按變體分子資料夾）
+│   ├── b8_q200/              #   batch=8, queries=200（預設）
+│   ├── b8_q50/               #   batch=8, queries=50（VRAM 優化版）
+│   ├── b4_q200/              #   batch=4, queries=200（低 VRAM 版本）
 │   └── tokenizer.json
 ├── features/                 # extract.py 自動產生的特徵檔
 │   ├── {class_name}/
@@ -29,10 +28,13 @@ sam3_pipeline/
 ├── Inputs/                   # 放來源影片和圖片
 ├── references/               # 放參考圖片（image prompt 用）
 ├── outputs/                  # 偵測結果輸出
-├── config.json               # 類別定義
+├── config.json               # 類別定義（預設指向 b8_q200 引擎）
+├── config_q50.json           # 相同類別，指向 b8_q50 引擎
 ├── config_editor.py          # 視覺化設定編輯器（獨立工具，見下方說明）
 ├── extract.py                # 第一步：預先計算 prompt 特徵
-└── infer.py                  # 第二步：跑偵測推論
+├── infer.py                  # 第二步：跑偵測推論（單攝影機）
+├── infer_multi.py            # 第二步替代：多攝影機管線（8 路同時）
+└── optimize.md               # QUERIES 優化實驗紀錄與結論
 ```
 
 ## 前置準備
@@ -50,7 +52,7 @@ sam3_pipeline/
 
 ```json
 {
-  "engines": "engines",
+  "engines": "engines/b8_q200",
   "tokenizer": "engines/tokenizer.json",
   "features": "features",
   "confidence": 0.3,
@@ -61,8 +63,9 @@ sam3_pipeline/
 }
 ```
 
+- `engines`：引擎資料夾路徑。改成 `"engines/b8_q50"` 可切換到 VRAM 優化版。詳見 [`optimize.md`](optimize.md)
 - `confidence`：信心值門檻，低於此分數的偵測會被過濾
-- `classes`：最多 4 個類別
+- `classes`：最多 8 個類別
 
 ### 第二步：產生 prompt 特徵檔
 
@@ -201,15 +204,55 @@ docker exec william_tensorrt python3 \
 
 ## 效能與 VRAM（RTX 5090 實測）
 
-| 類別數 | 引擎 batch | 平均耗時/幀 | 預估 FPS | VRAM 佔用 |
-|--------|-----------|------------|----------|----------|
-| 4（3 text + 1 image） | maxShapes=4 | ~70 ms | ~14 | **~5.0 GB** |
-| 4（3 text + 1 image） | maxShapes=8 | ~70 ms | ~14 | **~7.5 GB** |
+### 單攝影機（`infer.py`）
+
+| 類別數 | 引擎變體 | 平均耗時/幀 | 預估 FPS | VRAM 佔用 |
+|--------|---------|------------|----------|----------|
+| 4（3 text + 1 image） | b4_q200 | ~70 ms | ~14 | **~5.0 GB** |
+| 4（3 text + 1 image） | b8_q200 | ~70 ms | ~14 | **~7.5 GB** |
+
+### 多攝影機（`infer_multi.py`，8 路同時）
+
+| 引擎變體 | 平均耗時/輪 | 每路攝影機 | 總吞吐量 | VRAM 佔用 |
+|---------|-----------|----------|---------|----------|
+| b8_q200 | 426 ms | 53 ms | 18.8 FPS | **8.7 GB** |
+| b8_q50 | 425 ms | 53 ms | 18.8 FPS | **7.5 GB** |
+
+Q50 省了 ~1.2 GB VRAM，速度和品質零損失。完整分析見 [`optimize.md`](optimize.md)。
 
 - 首幀因為包含暖機會較慢（~100–350 ms），後續幀穩定
 - VRAM 主要被 TensorRT 的 activation memory 吃掉，在引擎載入時就會按 `maxShapes` 預先分配
-- 實際用幾個類別對 VRAM 影響極小 — 引擎會為最大 batch 預留記憶體，不管你實際用了幾個
+- `QUERIES` 值由 decoder engine 自動偵測，不需手動設定
 - 要改變最大類別數，需要用不同的 batch 重建引擎（見 [`setup/README.md`](setup/README.md)）
+
+## 多攝影機模式（`infer_multi.py`）
+
+同時處理多路攝影機畫面（Plan C v3 架構）：
+
+```bash
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config.json \
+  --video /root/VisionDSL/models/sam3_pipeline/Inputs/media1.mp4 \
+  --cameras 8 \
+  --output /root/VisionDSL/models/sam3_pipeline/outputs
+```
+
+核心優化：
+- **VE batch=F**：所有攝影機畫面一次跑完 vision encoder
+- **零拷貝 FPN**：VE output buffer 直接作為 decoder input
+- **Decoder 迭代 class**：每個 class 用 batch=F（所有畫面）
+- **Double-buffered output**：decoder N+1 和 mask copy N 重疊執行
+- **選擇性 mask 複製**：只傳輸有偵測到的 mask（~40 倍 PCIe 頻寬節省）
+
+| 參數 | 預設值 | 說明 |
+|------|--------|------|
+| `--config` | （必填） | config.json 路徑 |
+| `--video` | （必填） | 影片路徑 |
+| `--cameras` | `8` | 模擬攝影機數量 |
+| `--output` | `outputs` | 輸出目錄 |
+| `--conf` | config 裡的值 | 覆蓋信心值門檻 |
+| `--interval` | `1` | 最小幀間距 |
 
 ## 整體流程圖
 

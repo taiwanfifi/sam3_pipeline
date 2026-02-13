@@ -30,10 +30,12 @@
 setup/
 ├── README.md                  ← 你正在看的這份指南
 ├── export_sam3_to_onnx.py     ← PyTorch → ONNX 匯出腳本
-└── onnx_to_tensorrt.sh        ← ONNX → TensorRT 引擎轉換腳本
+├── onnx_to_tensorrt.sh        ← ONNX → TensorRT 引擎轉換腳本
+└── onnx_q50/                  ← Q50 decoder ONNX（--num-queries 50 匯出）
+    └── decoder.onnx
 ```
 
-轉換完成後，引擎會自動輸出到上一層的 `engines/` 資料夾。
+轉換完成後，引擎會儲存到 `engines/` 的子資料夾（如 `engines/b8_q200/`）。
 
 ---
 
@@ -142,8 +144,24 @@ setup/onnx/
 ├── vision-encoder.onnx     # 878 MB
 ├── text-encoder.onnx       # 675 MB
 ├── geometry-encoder.onnx   #  16 MB
-└── decoder.onnx            #  47 MB
+└── decoder.onnx            #  47 MB (queries=200)
 ```
+
+**匯出 VRAM 優化版 decoder（queries=50）：**
+
+如果只需要匯出 queries=50 的 decoder，不需要重新匯出其他 3 個 encoder：
+
+```bash
+docker exec sam3_pytorch python3 \
+  /root/sam3_pipeline/setup/export_sam3_to_onnx.py \
+  --module decoder \
+  --model-path facebook/sam3 \
+  --output-dir /root/sam3_pipeline/setup/onnx_q50 \
+  --num-queries 50 \
+  --device cuda
+```
+
+`--num-queries` 控制 decoder 輸出候選數量。DETR 內部仍用完整 200 queries 做 cross-attention，偵測品質不受影響，只有 output buffer 縮小。詳見 [`optimize.md`](../optimize.md)。
 
 PyTorch 容器的任務到此結束，可以刪除：
 
@@ -199,11 +217,21 @@ print('OK')
 > **如果你的 GPU 跟我們一樣（RTX 5090），跳過這步** — `engines/` 裡的引擎可以直接用。
 
 ```bash
+# 轉換標準版 (queries=200)
 docker exec sam3_trt bash /root/sam3_pipeline/setup/onnx_to_tensorrt.sh \
-  /root/sam3_pipeline/setup/onnx
+  /root/sam3_pipeline/setup/onnx \
+  /root/sam3_pipeline/engines/b8_q200
+
+# 轉換優化版 decoder (queries=50) — 只需要 decoder
+docker exec sam3_trt trtexec --fp16 \
+  --onnx=/root/sam3_pipeline/setup/onnx_q50/decoder.onnx \
+  --saveEngine=/root/sam3_pipeline/engines/b8_q50/decoder.engine \
+  --minShapes=fpn_feat_0:1x256x288x288,fpn_feat_1:1x256x144x144,fpn_feat_2:1x256x72x72,fpn_pos_2:1x256x72x72,prompt_features:1x1x256,prompt_mask:1x1 \
+  --optShapes=fpn_feat_0:1x256x288x288,fpn_feat_1:1x256x144x144,fpn_feat_2:1x256x72x72,fpn_pos_2:1x256x72x72,prompt_features:1x33x256,prompt_mask:1x33 \
+  --maxShapes=fpn_feat_0:8x256x288x288,fpn_feat_1:8x256x144x144,fpn_feat_2:8x256x72x72,fpn_pos_2:8x256x72x72,prompt_features:8x60x256,prompt_mask:8x60
 ```
 
-轉換約需 5~15 分鐘。完成後引擎會出現在 `engines/` 資料夾。
+轉換約需 2~15 分鐘（decoder 最快 ~2 分鐘，VE 最久）。
 
 ### 3.5 驗證引擎
 
@@ -212,7 +240,7 @@ docker exec sam3_trt python3 -c "
 import tensorrt as trt
 trt.init_libnvinfer_plugins(trt.Logger(), '')
 for name in ['vision-encoder', 'text-encoder', 'geometry-encoder', 'decoder']:
-    path = '/root/sam3_pipeline/engines/' + name + '.engine'
+    path = '/root/sam3_pipeline/engines/b8_q200/' + name + '.engine'
     with open(path, 'rb') as f:
         engine = trt.Runtime(trt.Logger()).deserialize_cuda_engine(f.read())
     print(name + ':', 'OK' if engine else 'FAILED')
@@ -297,10 +325,31 @@ docker exec sam3_trt bash /root/sam3_pipeline/setup/onnx_to_tensorrt.sh \
 
 然後把 `extract.py`、`infer.py`、`config_editor.py` 裡的 `MAX_CLASSES` 常數也改成對應的值。
 
-### 預設引擎
+### 引擎目錄結構
 
-`engines/` 裡的預設引擎為 **batch=8**（MAX_CLASSES=8）。
-`engines/backup_batch4/` 保留了 batch=4 版本，如需切換可直接覆蓋。
+引擎按 `b{batch}_q{queries}` 命名的子資料夾存放，每組 4 個引擎必須匹配：
+
+```
+engines/
+├── b8_q200/                      ← batch=8, queries=200（預設）
+│   ├── vision-encoder.engine
+│   ├── text-encoder.engine
+│   ├── geometry-encoder.engine
+│   └── decoder.engine
+├── b8_q50/                       ← batch=8, queries=50（VRAM 優化版）
+│   ├── vision-encoder.engine     → symlink to b8_q200/
+│   ├── text-encoder.engine       → symlink to b8_q200/
+│   ├── geometry-encoder.engine   → symlink to b8_q200/
+│   └── decoder.engine            （獨立建置）
+├── b4_q200/                      ← batch=4, queries=200（低 VRAM 版本）
+│   └── ...
+└── tokenizer.json                ← 共用
+```
+
+只有 decoder 受 queries 影響，其他 3 個 engine 可用 symlink 共用。
+切換引擎只需改 `config.json` 的 `engines` 路徑（如 `"engines": "engines/b8_q50"`）。
+
+Q200 vs Q50 的詳細比較見 [`optimize.md`](../optimize.md)。
 
 ---
 

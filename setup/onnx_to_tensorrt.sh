@@ -35,10 +35,11 @@
 #    詳見 setup/README.md 的「最大類別數」章節。
 #
 #  使用方式（在 TensorRT 容器內執行）：
-#    bash onnx_to_tensorrt.sh <onnx 資料夾路徑>
+#    bash onnx_to_tensorrt.sh <onnx 資料夾路徑> [輸出資料夾路徑]
 #
 #  範例：
 #    bash onnx_to_tensorrt.sh /root/sam3_pipeline/setup/onnx
+#    bash onnx_to_tensorrt.sh /root/sam3_pipeline/setup/onnx /root/sam3_pipeline/engines/b8_q200
 #
 #  轉換時間：
 #    約 5~15 分鐘（視 GPU 而定），大部分時間花在 Vision Encoder。
@@ -49,8 +50,8 @@
 
 set -e  # 任何指令失敗就立即停止
 
-ONNX_DIR="${1:?用法: bash onnx_to_tensorrt.sh <onnx 資料夾路徑>}"
-OUT_DIR="$(dirname "$0")/../engines"
+ONNX_DIR="${1:?用法: bash onnx_to_tensorrt.sh <onnx 資料夾路徑> [輸出資料夾路徑]}"
+OUT_DIR="${2:-$(dirname "$0")/../engines/b8_q200}"
 
 # --- 前置檢查 ---
 # 確認所有 ONNX 檔案都存在，避免轉到一半才發現少了檔案

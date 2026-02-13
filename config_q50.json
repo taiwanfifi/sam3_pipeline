@@ -1,5 +1,5 @@
 {
-  "engines": "engines/b8_q200",
+  "engines": "engines/b8_q50",
   "tokenizer": "engines/tokenizer.json",
   "features": "features",
   "confidence": 0.3,
