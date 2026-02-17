@@ -153,3 +153,22 @@ engines/
 | 建議 | 監控場景建議直接用 Q50 |
 
 如果 VRAM 不是限制因素，Q200 和 Q50 可以共存。透過 `config.json` 的 `engines` 路徑切換即可。
+
+---
+
+## 延伸：與解析度優化組合
+
+Q50 可以跟降解析度疊加使用。在 8 GB VRAM + 8 路攝影機的部署場景中，
+`Q50 + 672 解析度` 或 `Q50 + 560 解析度` 是最佳組合：
+
+| 組合 | 8 路 VRAM | 每路 FPS | Config |
+|------|:---:|:---:|------|
+| Q200 @ 1008 | 8,718 MB | 2.3 | `config.json` |
+| Q50 @ 1008 | 7,500 MB | 2.3 | `config_q50.json` |
+| Q50 @ 840 | 12,909 MB | 2.2 | `config_q50_r840.json` |
+| **Q50 @ 672** | **4,846 MB** | **4.0** | `config_q50_r672.json` |
+| **Q50 @ 560** | **4,060 MB** | **4.6** | `config_q50_r560.json` |
+
+> 840 在 8 路模式下 VRAM 反而比 1008 高（12.9 GB > 7.5 GB），
+> 因為 multi-camera 的 FPN buffer 在 batch=8 時放大更多。
+> 詳見 [`setup/resolution_guide.md`](setup/resolution_guide.md)。

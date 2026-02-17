@@ -1,0 +1,57 @@
+{
+  "engines": "engines/b8_q50_r840",
+  "tokenizer": "engines/tokenizer.json",
+  "features": "features",
+  "confidence": 0.3,
+  "classes": [
+    {
+      "name": "person",
+      "prompt_type": "text",
+      "text": "person"
+    },
+    {
+      "name": "counter",
+      "prompt_type": "text",
+      "text": "counter"
+    },
+    {
+      "name": "hand",
+      "prompt_type": "text",
+      "text": "hand"
+    },
+    {
+      "name": "blow_gun",
+      "prompt_type": "image",
+      "references": [
+        {
+          "image": "references/中華汽車/image13.png",
+          "boxes": [
+            [
+              0.2064,
+              0.8635,
+              0.3725,
+              0.1556
+            ]
+          ],
+          "labels": [
+            1
+          ]
+        },
+        {
+          "image": "references/中華汽車/image2.png",
+          "boxes": [
+            [
+              0.2369,
+              0.9257,
+              0.4236,
+              0.1389
+            ]
+          ],
+          "labels": [
+            1
+          ]
+        }
+      ]
+    }
+  ]
+}

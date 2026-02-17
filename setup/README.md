@@ -29,13 +29,29 @@
 ```
 setup/
 ├── README.md                  ← 你正在看的這份指南
+├── quantization_guide.md      ← INT8 量化教學（原理 + 實驗結果 + 指令）
+├── resolution_guide.md        ← 解析度調整教學（VRAM 計算 + benchmark + 決策框架）
 ├── export_sam3_to_onnx.py     ← PyTorch → ONNX 匯出腳本
 ├── onnx_to_tensorrt.sh        ← ONNX → TensorRT 引擎轉換腳本
-└── onnx_q50/                  ← Q50 decoder ONNX（--num-queries 50 匯出）
-    └── decoder.onnx
+├── build_int8_ve.py           ← INT8 VE 校準 + 建置腳本
+├── onnx_q50/                  ← Q50 decoder ONNX（--num-queries 50 匯出）
+├── onnx_r672_q50/             ← 672 解析度 ONNX（VE + decoder + GE，TE symlink）
+└── onnx_r560_q50/             ← 560 解析度 ONNX
 ```
 
-轉換完成後，引擎會儲存到 `engines/` 的子資料夾（如 `engines/b8_q200/`）。
+轉換完成後，引擎會儲存到 `engines/` 的子資料夾。命名規則：`b{batch}_q{queries}[_r{resolution}][_int8]`。
+
+```
+engines/
+├── b8_q200/                   ← 1008, batch=8, queries=200（原始版）
+├── b8_q50/                    ← 1008, batch=8, queries=50（推薦預設）
+├── b8_q50_r840/               ← 840, Q50
+├── b8_q200_r840/              ← 840, Q200
+├── b8_q50_r672/               ← 672, Q50（8 GB 部署推薦）
+├── b8_q50_r560/               ← 560, Q50（8 GB 部署最省 VRAM）
+├── b8_q50_int8/               ← 1008, INT8 VE（實驗性，見 quantization_guide.md）
+└── tokenizer.json             ← 共用
+```
 
 ---
 
@@ -249,7 +265,100 @@ for name in ['vision-encoder', 'text-encoder', 'geometry-encoder', 'decoder']:
 
 4 個都顯示 OK 就完成了。
 
-### 3.6 清理（選擇性）
+### 3.6 轉換不同解析度的引擎（降 VRAM / 提速）
+
+預設 1008 解析度在 8 路攝影機時需要大量 VRAM。降低解析度可以大幅省 VRAM 和提速。
+完整原理見 [`resolution_guide.md`](resolution_guide.md)。
+
+**核心概念**：解析度是「烤」進 ONNX 的（RoPE 位置編碼綁定 patch 數量），不同解析度需要各自匯出 ONNX。
+
+以 672 解析度為例：
+
+```bash
+# === 步驟 1: 匯出 672 的 ONNX（在 PyTorch 容器中） ===
+
+# VE — 必須重新匯出（RoPE 綁定解析度）
+docker exec <sam3 容器> python3 \
+  /root/sam3_pipeline/setup/export_sam3_to_onnx.py \
+  --module vision \
+  --model-path facebook/sam3 \
+  --image-size 672 \
+  --output-dir /root/sam3_pipeline/setup/onnx_r672_q50 \
+  --device cuda
+
+# Decoder — 必須重新匯出（FPN 輸入大小綁定解析度）
+docker exec <sam3 容器> python3 \
+  /root/sam3_pipeline/setup/export_sam3_to_onnx.py \
+  --module decoder \
+  --model-path facebook/sam3 \
+  --image-size 672 \
+  --num-queries 50 \
+  --output-dir /root/sam3_pipeline/setup/onnx_r672_q50 \
+  --device cuda
+
+# GE — 必須重新匯出（FPN 輸入大小綁定解析度）
+docker exec <sam3 容器> python3 \
+  /root/sam3_pipeline/setup/export_sam3_to_onnx.py \
+  --module geometry \
+  --model-path facebook/sam3 \
+  --image-size 672 \
+  --output-dir /root/sam3_pipeline/setup/onnx_r672_q50 \
+  --device cuda
+
+# TE — 跟解析度無關，symlink 共用
+cd /root/sam3_pipeline/setup/onnx_r672_q50
+ln -s ../onnx_q50/text-encoder.onnx text-encoder.onnx
+```
+
+> **匯出參數說明**：
+> - `--module`：只匯出指定子模型（vision/decoder/geometry/text）
+> - `--image-size`：輸入解析度，必須是 14 的倍數
+> - `--num-queries`：decoder 輸出候選數（50 = VRAM 優化版，詳見 [`optimize.md`](../optimize.md)）
+> - 匯出每個子模型約需 1-2 分鐘（加載模型 + ONNX trace）
+
+```bash
+# === 步驟 2: 建 TensorRT 引擎（在 TensorRT 容器中） ===
+
+docker exec sam3_trt bash /root/sam3_pipeline/setup/onnx_to_tensorrt.sh \
+  /root/sam3_pipeline/setup/onnx_r672_q50 \
+  /root/sam3_pipeline/engines/b8_q50_r672 \
+  672
+```
+
+> `onnx_to_tensorrt.sh` 的第三個參數是解析度。它會自動計算 FPN 尺寸：
+> `patches = 672 / 14 = 48` → FPN = 192/96/48
+>
+> 轉換約需 10-15 分鐘（VE 最久 ~6 分鐘）。
+
+```bash
+# === 步驟 3: 建立 config ===
+
+# 複製一份 config，把 engines 路徑改成新的
+cp config_q50.json config_q50_r672.json
+# 編輯: "engines": "engines/b8_q50_r672"
+```
+
+```bash
+# === 步驟 4: 驗證 ===
+
+docker exec sam3_trt python3 /root/sam3_pipeline/infer.py \
+  --config /root/sam3_pipeline/config_q50_r672.json \
+  --images /root/sam3_pipeline/Inputs/demo_3.jpg \
+  --output /root/sam3_pipeline/outputs/test_672
+```
+
+560 解析度流程完全相同，把所有 `672` 換成 `560`，`r672` 換成 `r560`。
+
+**哪些需要重新匯出？**
+
+| 子模型 | 跟解析度有關？ | 原因 |
+|--------|:---:|------|
+| Vision Encoder | ✅ 必須 | RoPE 位置編碼綁定 patch 數 |
+| Geometry Encoder | ✅ 必須 | FPN 輸入大小綁定解析度 |
+| **Text Encoder** | **❌** | 只處理文字 token，跟解析度無關 |
+| Decoder | ✅ 必須 | FPN 輸入大小綁定解析度 |
+
+### 3.7 清理（選擇性）
 
 ONNX 檔案不再需要，可以刪除以節省空間：
 
@@ -327,29 +436,45 @@ docker exec sam3_trt bash /root/sam3_pipeline/setup/onnx_to_tensorrt.sh \
 
 ### 引擎目錄結構
 
-引擎按 `b{batch}_q{queries}` 命名的子資料夾存放，每組 4 個引擎必須匹配：
+引擎按 `b{batch}_q{queries}[_r{resolution}][_int8]` 命名，每組 4 個引擎必須匹配：
 
 ```
 engines/
-├── b8_q200/                      ← batch=8, queries=200（預設）
+├── b8_q200/                      ← 1008, batch=8, queries=200
 │   ├── vision-encoder.engine
 │   ├── text-encoder.engine
 │   ├── geometry-encoder.engine
 │   └── decoder.engine
-├── b8_q50/                       ← batch=8, queries=50（VRAM 優化版）
+├── b8_q50/                       ← 1008, batch=8, queries=50（推薦預設）
 │   ├── vision-encoder.engine     → symlink to b8_q200/
 │   ├── text-encoder.engine       → symlink to b8_q200/
 │   ├── geometry-encoder.engine   → symlink to b8_q200/
-│   └── decoder.engine            （獨立建置）
-├── b4_q200/                      ← batch=4, queries=200（低 VRAM 版本）
+│   └── decoder.engine            （Q50 獨立建置）
+├── b8_q50_r840/                  ← 840 解析度（12 GB+ VRAM）
+│   └── ...                       （VE/GE/decoder 各自建置，TE symlink）
+├── b8_q50_r672/                  ← 672 解析度（8 GB 部署推薦）
 │   └── ...
+├── b8_q50_r560/                  ← 560 解析度（8 GB 部署最省 VRAM）
+│   └── ...
+├── b8_q50_int8/                  ← 1008, INT8 VE（實驗性）
+│   ├── vision-encoder.engine     （INT8 獨立建置）
+│   ├── text-encoder.engine       → symlink to b8_q50/
+│   ├── geometry-encoder.engine   → symlink to b8_q50/
+│   └── decoder.engine            → symlink to b8_q50/
 └── tokenizer.json                ← 共用
 ```
 
-只有 decoder 受 queries 影響，其他 3 個 engine 可用 symlink 共用。
-切換引擎只需改 `config.json` 的 `engines` 路徑（如 `"engines": "engines/b8_q50"`）。
+**Symlink 規則**：
+- 只有 **decoder** 受 queries 數量影響（Q200 vs Q50）
+- 只有 **VE / GE / decoder** 受解析度影響，**TE 永遠可以共用**
+- 只有 **VE** 受精度影響（INT8 vs FP16），其他三個保持 FP16
 
-Q200 vs Q50 的詳細比較見 [`optimize.md`](../optimize.md)。
+切換引擎只需改 `config.json` 的 `engines` 路徑（如 `"engines": "engines/b8_q50_r672"`）。
+
+**相關文件**：
+- Q200 vs Q50 比較 → [`optimize.md`](../optimize.md)
+- 解析度選擇指南 → [`resolution_guide.md`](resolution_guide.md)
+- INT8 量化實驗 → [`quantization_guide.md`](quantization_guide.md)
 
 ---
 
