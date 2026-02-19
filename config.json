@@ -1,42 +1,28 @@
 {
-  "engines": "engines/b8_q200",
+  "engines": "engines/b8_q50_r448",
   "tokenizer": "engines/tokenizer.json",
   "features": "features",
   "confidence": 0.3,
   "classes": [
     {
-      "name": "person",
+      "name": "PERSON",
       "prompt_type": "text",
-      "text": "person"
+      "text": "people"
     },
     {
-      "name": "counter",
+      "name": "HEAD",
       "prompt_type": "text",
-      "text": "counter"
+      "text": "head"
     },
     {
-      "name": "hand",
+      "name": "HAND",
       "prompt_type": "text",
       "text": "hand"
     },
     {
-      "name": "blow_gun",
-      "prompt_type": "image",
+      "name": "SCREWDRIVER",
+      "prompt_type": "both",
       "references": [
-        {
-          "image": "references/中華汽車/image13.png",
-          "boxes": [
-            [
-              0.2064,
-              0.8635,
-              0.3725,
-              0.1556
-            ]
-          ],
-          "labels": [
-            1
-          ]
-        },
         {
           "image": "references/中華汽車/image2.png",
           "boxes": [
@@ -51,7 +37,8 @@
             1
           ]
         }
-      ]
+      ],
+      "text": "pneumatic screwdriver"
     }
   ]
 }

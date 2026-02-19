@@ -134,6 +134,10 @@ class Extractor:
         self.vision_engine = load_engine(str(engine_dir / "vision-encoder.engine"))
         self.vision_ctx = self.vision_engine.create_execution_context()
         self.vision_in, self.vision_out = make_buffers(self.vision_engine)
+        # Auto-detect resolution from engine profile
+        ve_min = self.vision_engine.get_tensor_profile_shape("images", 0)[0]
+        self.image_size = ve_min[2]
+        print(f"  Resolution: {self.image_size}x{self.image_size} (auto-detected)")
 
         print("Loading geometry-encoder...")
         self.geo_engine = load_engine(str(engine_dir / "geometry-encoder.engine"))
@@ -161,7 +165,8 @@ class Extractor:
     def encode_image(self, image_bgr: np.ndarray):
         """-> dict with fpn_feat_0/1/2, fpn_pos_2"""
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        resized = np.array(PILImage.fromarray(rgb).resize((1008, 1008), PILImage.BILINEAR))
+        S = self.image_size
+        resized = np.array(PILImage.fromarray(rgb).resize((S, S), PILImage.BILINEAR))
         tensor = (resized.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)[np.newaxis]
 
         fill(self.vision_in[0], tensor)
