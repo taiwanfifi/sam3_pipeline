@@ -1,0 +1,44 @@
+{
+  "engines": "engines/b8_q50_r560",
+  "tokenizer": "engines/tokenizer.json",
+  "features": "features",
+  "confidence": 0.3,
+  "classes": [
+    {
+      "name": "PERSON",
+      "prompt_type": "text",
+      "text": "people"
+    },
+    {
+      "name": "HEAD",
+      "prompt_type": "text",
+      "text": "head"
+    },
+    {
+      "name": "HAND",
+      "prompt_type": "text",
+      "text": "hand"
+    },
+    {
+      "name": "SCREWDRIVER",
+      "prompt_type": "both",
+      "references": [
+        {
+          "image": "references/中華汽車/image2.png",
+          "boxes": [
+            [
+              0.2369,
+              0.9257,
+              0.4236,
+              0.1389
+            ]
+          ],
+          "labels": [
+            1
+          ]
+        }
+      ],
+      "text": "pneumatic screwdriver"
+    }
+  ]
+}

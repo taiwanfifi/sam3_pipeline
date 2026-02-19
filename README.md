@@ -38,9 +38,11 @@ sam3_pipeline/
 ├── extract.py                # Step 1: pre-compute prompt features
 ├── infer.py                  # Step 2: run detection (single camera)
 ├── infer_multi.py            # Step 2 alt: multi-camera pipeline (8 cameras)
-├── optimize.md               # QUERIES optimization experiment (Q200→Q50)
-├── setup/quantization_guide.md  # INT8 quantization guide & experiment
-└── setup/resolution_guide.md    # Resolution tuning guide & benchmarks
+├── BENCH_decoder_queries.md   # QUERIES optimization experiment (Q200→Q50)
+├── BENCH_resolution_video.md  # r448 vs r560 benchmark + video output overhead
+├── benchmark.sh               # Automated benchmark script (all resolutions)
+├── setup/TUTOR_quantization.md  # INT8 quantization guide & experiment
+└── setup/TUTOR_resolution.md    # Resolution tuning guide & benchmarks
 ```
 
 ## Prerequisites
@@ -101,12 +103,24 @@ docker exec william_tensorrt python3 \
   --config /root/VisionDSL/models/sam3_pipeline/config.json \
   --video /root/VisionDSL/models/sam3_pipeline/Inputs/media1.mp4 \
   --output /root/VisionDSL/models/sam3_pipeline/outputs
+
+# With overlay video output (debug mode)
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config.json \
+  --video /root/VisionDSL/models/sam3_pipeline/Inputs/media1.mp4 \
+  --output /root/VisionDSL/models/sam3_pipeline/outputs \
+  --save-video
 ```
 
 Video mode simulates real-time playback: after each inference, the video clock
 advances by the actual inference time. Frames that arrive while the GPU is busy
-are dropped. The output AVI plays at the exact achieved fps, matching the
-original video duration with zero drift.
+are dropped — exactly like a live camera feed.
+
+When `--save-video` is enabled, overlay frames are written directly to AVI (MJPG)
+in real-time during inference, then batch-converted to MP4 (H.264) after completion.
+This adds **zero overhead** to inference speed (see [`BENCH_resolution_video.md`](BENCH_resolution_video.md)).
+Video output is for **debug purposes only** — omit for benchmarking and production.
 
 ## Output Files
 
@@ -125,11 +139,22 @@ Each run produces timestamped output files (`YYYYMMDD_HHMMSS` prefix), so multip
 
 | File | Description |
 |------|-------------|
-| `{timestamp}_output.avi` | MJPG video with overlay frames |
 | `{timestamp}_detections.jsonl` | Per-frame detections (streaming JSONL, `tail -f` compatible) |
 | `{timestamp}_performance.json` | Timing stats |
+| `{timestamp}_output.mp4` | Overlay video (only with `--save-video`) |
+
+**Multi-camera video mode (`--save-video --save-cameras`):**
+
+| File | Description |
+|------|-------------|
+| `{timestamp}_detections.jsonl` | Per-frame detections for all cameras |
+| `{timestamp}_performance.json` | Timing stats |
+| `{timestamp}_grid.mp4` | 2×4 grid overview video (only with `--save-video`) |
+| `{timestamp}_cam{N}_{label}.mp4` | Per-camera overlay video (only with `--save-cameras`) |
 
 ## CLI Flags
+
+### `infer.py` (single camera)
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -140,6 +165,7 @@ Each run produces timestamped output files (`YYYYMMDD_HHMMSS` prefix), so multip
 | `--conf` | from config | Confidence threshold override |
 | `--interval` | `1` | Min frame gap (video); 1=GPU-adaptive, N=at most every Nth frame |
 | `--masks` | `false` | Save per-class mask PNGs |
+| `--save-video` | `false` | Save overlay video (debug). Adds rendering but zero inference overhead |
 
 ## Prompt Types
 
@@ -194,13 +220,13 @@ Text description + reference image. Features are concatenated.
 
 ### Single camera (`infer.py`, 4 classes: 3 text + 1 image, Q50)
 
-| Resolution | Engine variant | Avg ms | FPS | VRAM |
+| Resolution | Engine variant | Avg ms | FPS | VRAM buffers |
 |:---:|---------------|:---:|:---:|:---:|
 | 1008 | b8_q50 | 62.5 ms | 16.0 | **7,064 MB** |
 | 840 | b8_q50_r840 | 50.3 ms | 19.9 | **6,050 MB** |
 | 672 | b8_q50_r672 | 35.1 ms | 28.5 | **4,582 MB** |
-| 560 | b8_q50_r560 | 28.4 ms | 35.2 | **3,874 MB** |
-| 448 | b8_q50_r448 | 41.6 ms | 24.0 | **3,251 MB** |
+| **560** | b8_q50_r560 | **30.3 ms** | **33.0** | **195 MB** |
+| **448** | b8_q50_r448 | **26.1 ms** | **38.4** | **125 MB** |
 
 ### Multi-camera (`infer_multi.py`, 8 cameras, 3 videos cycled, Q50)
 
@@ -210,12 +236,13 @@ Text description + reference image. Features are concatenated.
 | 1008 (Q50) | 425 ms | 53 ms | 2.3 | 18.8 | 1,238 MB |
 | 840 | 446 ms | 55.8 ms | 2.2 | 17.9 | — |
 | **672** | **253 ms** | **31.6 ms** | **4.0** | **31.7** | — |
-| **560** | **147 ms** | **18.4 ms** | **6.8** | **54.3** | **383 MB** |
-| **448** | **132 ms** | **16.4 ms** | **7.6** | **60.8** | **246 MB** |
+| **560** | **132.8 ms** | **16.6 ms** | **7.5** | **60.2** | **383 MB** |
+| **448** | **108.6 ms** | **13.6 ms** | **9.2** | **73.6** | **246 MB** |
 
-> **8 GB deployment**: 560 (6.8 FPS/cam) or 448 (7.6 FPS/cam) recommended.
+> **8 GB deployment**: 560 (7.5 FPS/cam) or 448 (9.2 FPS/cam) recommended.
 > 840 requires 12.9 GB — not feasible on 8 GB GPUs.
 > Q50 saves ~1.2 GB vs Q200 with zero quality loss. See [`optimize.md`](optimize.md).
+> Video output (`--save-video`) adds zero inference overhead. See [`BENCH_resolution_video.md`](BENCH_resolution_video.md).
 
 For resolution selection guide, see [`setup/resolution_guide.md`](setup/resolution_guide.md).
 For INT8 quantization experiment, see [`setup/quantization_guide.md`](setup/quantization_guide.md).
@@ -258,17 +285,28 @@ docker exec william_tensorrt python3 \
   --cameras 8
 ```
 
-**With grid overlay video (for visual review):**
+**With video output (debug mode):**
 
 ```bash
+# Grid video only
 docker exec william_tensorrt python3 \
   /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
   --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
   --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
   --cameras 8 --save-video
+
+# Grid + individual camera videos
+docker exec william_tensorrt python3 \
+  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
+  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
+  --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
+  --cameras 8 --save-video --save-cameras
 ```
 
-This produces a 2x4 grid AVI (`{timestamp}_grid.avi`) with all 8 camera overlays side by side. Slower than detection-only mode — use without `--save-video` for benchmarking.
+Videos are written as AVI (MJPG) in real-time during inference, then batch-converted
+to MP4 (H.264) after completion. The original AVIs are deleted on successful conversion.
+This adds **zero inference overhead** — use without `--save-video` only when you want
+smaller output directories. See [`BENCH_resolution_video.md`](BENCH_resolution_video.md) for benchmark proof.
 
 Key optimisations:
 - **VE batch=F**: all camera frames in one vision encoder pass
@@ -286,7 +324,8 @@ Key optimisations:
 | `--output` | `outputs` | Output directory |
 | `--conf` | from config | Confidence threshold override |
 | `--interval` | `1` | Min frame gap |
-| `--save-video` | `false` | Save 2x4 grid overlay AVI for visual review |
+| `--save-video` | `false` | Save 2×4 grid overlay video (AVI → MP4) |
+| `--save-cameras` | `false` | Save individual camera overlay videos (one MP4 per camera) |
 
 ## Two-Step Workflow
 
