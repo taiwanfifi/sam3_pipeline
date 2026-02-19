@@ -21,8 +21,8 @@ Usage (inside sam3_trt container):
 import cv2
 import json
 import time
-import shutil
 import argparse
+import subprocess
 import numpy as np
 from datetime import datetime
 from pathlib import Path
@@ -347,6 +347,20 @@ def run_tag():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def avi_to_mp4(avi_path: Path) -> Path:
+    """Convert AVI (MJPG) to MP4 (H.264) via ffmpeg, delete AVI on success."""
+    mp4_path = avi_path.with_suffix(".mp4")
+    cmd = ["ffmpeg", "-y", "-i", str(avi_path),
+           "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+           "-movflags", "+faststart", "-an", str(mp4_path)]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode == 0 and mp4_path.exists():
+        avi_path.unlink()
+        return mp4_path
+    print(f"  WARNING: ffmpeg failed for {avi_path.name}, keeping AVI")
+    return avi_path
+
+
 # ---------------------------------------------------------------------------
 # Image mode
 # ---------------------------------------------------------------------------
@@ -390,7 +404,8 @@ def run_images(pipe, paths, out_dir, conf, with_masks, tag):
 # Video mode
 # ---------------------------------------------------------------------------
 
-def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
+def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag,
+              save_video=False):
     """Adaptive real-time video inference.
 
     Simulates real-time playback: after each inference the video clock
@@ -401,15 +416,11 @@ def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
     limit, pure GPU-adaptive).  Setting --interval 5 means "process at
     most every 5th source frame", useful for limiting output size.
 
-    Phase 1: inference → temp overlay JPGs + streaming JSONL
-    Phase 2: combine JPGs into AVI at the exact achieved fps
-             (fps = n_processed / source_duration, no drift)
+    Phase 1: inference + real-time AVI output (MJPG direct write)
+    Phase 2: convert AVI → MP4 (H.264), delete AVI
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     jsonl = out_dir / f"{tag}_detections.jsonl"
-    avi   = out_dir / f"{tag}_output.avi"
-    tmp   = out_dir / f".tmp_{tag}"
-    tmp.mkdir(exist_ok=True)
     times = []
 
     cap = cv2.VideoCapture(video_path)
@@ -427,10 +438,19 @@ def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
     print(f"Video: {total} frames, {src_fps:.1f} fps, "
           f"duration {duration:.1f}s, interval>={interval}")
 
-    # --- Phase 1: adaptive inference → temp JPGs + JSONL ---
+    # --- AVI writer (real-time direct write) ---
+    writer = None
+    avi_path = None
+    if save_video:
+        avi_path = out_dir / f"{tag}_output.avi"
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        writer = cv2.VideoWriter(str(avi_path), fourcc, src_fps, (w, h))
+        print("Video output: ENABLED (real-time AVI)")
+
+    # --- Phase 1: adaptive inference + real-time AVI ---
     video_clock = 0.0
     next_idx = 0       # next source frame to process
-    n_out = 0          # overlay frames written
+    n_out = 0          # frames written
     frame_idx = -1
 
     with open(jsonl, "w") as f:
@@ -451,9 +471,9 @@ def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
             ts = timestamp(frame_idx, src_fps)
             print(f"[{ts}] #{frame_idx}: {len(dets)} dets, {dt*1000:.0f} ms")
 
-            overlay = draw_overlay(frame, dets)
-            cv2.imwrite(str(tmp / f"{n_out:06d}.jpg"), overlay)
-            n_out += 1
+            if writer is not None:
+                overlay = draw_overlay(frame, dets)
+                writer.write(overlay)
 
             if with_masks and dets:
                 save_masks(dets, frame.shape[:2], out_dir, ts)
@@ -464,6 +484,7 @@ def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
                                    "score": d["score"]} for d in dets]}
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
+            n_out += 1
 
             # advance video clock by real inference time (or interval floor)
             video_clock += max(dt, min_advance)
@@ -472,22 +493,17 @@ def run_video(pipe, video_path, out_dir, conf, with_masks, interval, tag):
                 next_idx = frame_idx + 1            # at least move forward
 
     cap.release()
+    if writer is not None:
+        writer.release()
     print(f"\nProcessed {n_out}/{total} frames")
 
-    # --- Phase 2: combine temp JPGs → AVI at exact fps ---
-    if n_out > 0:
-        actual_fps = n_out / duration
-        print(f"Combining AVI @ {actual_fps:.1f} fps ...")
+    # --- Phase 2: AVI → MP4 ---
+    if avi_path is not None and avi_path.exists():
+        print("Converting AVI → MP4 ...")
+        out_path = avi_to_mp4(avi_path)
+        sz_mb = out_path.stat().st_size / 1048576
+        print(f"Output: {out_path.name} ({sz_mb:.0f} MB)")
 
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        writer = cv2.VideoWriter(str(avi), fourcc, actual_fps, (w, h))
-        for i in range(n_out):
-            img = cv2.imread(str(tmp / f"{i:06d}.jpg"))
-            writer.write(img)
-        writer.release()
-        print(f"Output: {avi.name}")
-
-    shutil.rmtree(tmp, ignore_errors=True)
     return times
 
 
@@ -531,6 +547,9 @@ def main():
     ap.add_argument("--interval", type=int, default=1,
                     help="Min frame gap (video); 1=GPU-adaptive, N=at most every Nth frame")
     ap.add_argument("--masks", action="store_true", help="Save per-class mask PNGs")
+    ap.add_argument("--save-video", action="store_true",
+                    help="Save overlay video (debug). Adds rendering overhead -- "
+                         "omit for speed benchmarks.")
     args = ap.parse_args()
 
     out = Path(args.output)
@@ -541,7 +560,8 @@ def main():
     if args.images:
         times = run_images(pipe, args.images, out, conf, args.masks, tag)
     else:
-        times = run_video(pipe, args.video, out, conf, args.masks, args.interval, tag)
+        times = run_video(pipe, args.video, out, conf, args.masks, args.interval,
+                          tag, save_video=args.save_video)
 
     write_performance(times, out, pipe, tag)
 

@@ -29,8 +29,8 @@ Usage (inside sam3_trt container):
 import cv2
 import json
 import time
-import shutil
 import argparse
+import subprocess
 import numpy as np
 from datetime import datetime
 from pathlib import Path
@@ -477,12 +477,26 @@ def run_tag():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def avi_to_mp4(avi_path: Path) -> Path:
+    """Convert AVI (MJPG) to MP4 (H.264) via ffmpeg, delete AVI on success."""
+    mp4_path = avi_path.with_suffix(".mp4")
+    cmd = ["ffmpeg", "-y", "-i", str(avi_path),
+           "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+           "-movflags", "+faststart", "-an", str(mp4_path)]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode == 0 and mp4_path.exists():
+        avi_path.unlink()
+        return mp4_path
+    print(f"  WARNING: ffmpeg failed for {avi_path.name}, keeping AVI")
+    return avi_path
+
+
 # ---------------------------------------------------------------------------
 # Video mode
 # ---------------------------------------------------------------------------
 
 def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag,
-                    save_video=False):
+                    save_video=False, save_cameras=False):
     """Multi-camera video inference with real different video sources.
 
     Each video_path gets its own cv2.VideoCapture.  If fewer videos than
@@ -490,9 +504,8 @@ def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag,
     driven by the first video; when any camera's video ends it loops from
     the beginning.
 
-    When save_video=True, produces a grid overlay video (2x4 layout) for
-    visual review. This adds overlay rendering overhead and is not intended
-    for benchmarking -- run without --save-video for pure speed tests.
+    Phase 1: inference + real-time AVI direct write (MJPG)
+    Phase 2: batch convert all AVI → MP4 (H.264), delete AVIs
     """
     F = pipe.F
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -523,16 +536,35 @@ def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag,
         print(f"  cam[{i}]: {label}")
     print(f"Master clock: {total} frames, {src_fps:.1f} fps, {duration:.1f}s")
     if save_video:
-        print("Grid video output: ENABLED")
+        print("Grid video output: ENABLED (real-time AVI)")
+    if save_cameras:
+        print("Individual camera video output: ENABLED (real-time AVI)")
     print()
 
-    # Grid video setup
+    # --- AVI writers (real-time direct write) ---
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    avi_paths = []  # collect all AVI paths for batch conversion
+
+    grid_writer = None
     if save_video:
         CELL_W, CELL_H = 480, 270
         cols = min(F, 4)
-        grid_w, grid_h = cols * CELL_W, (F + cols - 1) // cols * CELL_H
-        tmp = out_dir / f".tmp_{tag}"
-        tmp.mkdir(exist_ok=True)
+        grid_w = cols * CELL_W
+        grid_h = ((F + cols - 1) // cols) * CELL_H
+        grid_avi = out_dir / f"{tag}_grid.avi"
+        grid_writer = cv2.VideoWriter(str(grid_avi), fourcc, src_fps,
+                                      (grid_w, grid_h))
+        avi_paths.append(grid_avi)
+
+    cam_writers = []
+    if save_cameras:
+        for ci in range(F):
+            cam_avi = out_dir / f"{tag}_cam{ci}_{cam_labels[ci]}.avi"
+            cam_w = int(caps[ci].get(cv2.CAP_PROP_FRAME_WIDTH))
+            cam_h = int(caps[ci].get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cam_writers.append(
+                cv2.VideoWriter(str(cam_avi), fourcc, src_fps, (cam_w, cam_h)))
+            avi_paths.append(cam_avi)
 
     video_clock = 0.0
     next_idx = 0
@@ -546,6 +578,7 @@ def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag,
             ok, frame = cap.read()
         return frame if ok else None
 
+    # --- Phase 1: inference + real-time AVI output ---
     with open(jsonl, "w") as f:
         while True:
             # Master camera drives the loop
@@ -580,11 +613,17 @@ def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag,
             print(f"#{frame_idx}: {dt*1000:.0f} ms total ({per_cam:.0f} ms/cam), "
                   f"{total_dets} dets [{det_str}]")
 
-            # Save grid overlay frame
-            if save_video:
+            # Write grid overlay directly to AVI
+            if grid_writer is not None:
                 grid = compose_grid(frames, all_dets, cam_labels,
                                     F, cols, CELL_W, CELL_H)
-                cv2.imwrite(str(tmp / f"{n_out:06d}.jpg"), grid)
+                grid_writer.write(grid)
+
+            # Write individual camera overlays directly to AVI
+            if cam_writers:
+                for ci in range(F):
+                    overlay = draw_overlay(frames[ci], all_dets[ci])
+                    cam_writers[ci].write(overlay)
 
             row = {
                 "frame_idx": frame_idx,
@@ -605,24 +644,23 @@ def run_multi_video(pipe, video_paths, out_dir, conf, interval, tag,
             if next_idx <= frame_idx:
                 next_idx = frame_idx + 1
 
+    # Release all resources
     for cap in caps:
         cap.release()
+    if grid_writer is not None:
+        grid_writer.release()
+    for w in cam_writers:
+        w.release()
     print(f"\nProcessed {n_out}/{total} master frames")
 
-    # Phase 2: combine grid overlay frames -> AVI
-    if save_video and n_out > 0:
-        avi = out_dir / f"{tag}_grid.avi"
-        actual_fps = max(1.0, n_out / duration)
-        print(f"Combining grid AVI @ {actual_fps:.1f} fps ...")
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        writer = cv2.VideoWriter(str(avi), fourcc, actual_fps,
-                                 (grid_w, grid_h))
-        for i in range(n_out):
-            img = cv2.imread(str(tmp / f"{i:06d}.jpg"))
-            writer.write(img)
-        writer.release()
-        shutil.rmtree(tmp, ignore_errors=True)
-        print(f"Grid video: {avi.name}")
+    # --- Phase 2: batch convert all AVI → MP4 ---
+    if avi_paths:
+        print(f"\nConverting {len(avi_paths)} AVI → MP4 ...")
+        for avi in avi_paths:
+            if avi.exists():
+                out_path = avi_to_mp4(avi)
+                sz_mb = out_path.stat().st_size / 1048576
+                print(f"  {out_path.name} ({sz_mb:.0f} MB)")
 
     return times
 
@@ -687,6 +725,9 @@ def main():
                     help="Save grid overlay video (2x4 layout) for visual "
                          "review. Adds rendering overhead -- omit for speed "
                          "benchmarks.")
+    ap.add_argument("--save-cameras", action="store_true",
+                    help="Save individual camera overlay videos (one AVI per "
+                         "camera). Can be combined with --save-video.")
     args = ap.parse_args()
 
     out = Path(args.output)
@@ -695,7 +736,8 @@ def main():
     tag = run_tag()
 
     times = run_multi_video(pipe, args.video, out, conf, args.interval, tag,
-                            save_video=args.save_video)
+                            save_video=args.save_video,
+                            save_cameras=args.save_cameras)
     write_performance(times, out, pipe, tag, video_paths=args.video)
 
 
