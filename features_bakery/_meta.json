@@ -1,0 +1,10 @@
+{
+  "max_prompt_len": 32,
+  "num_classes": 4,
+  "class_names": [
+    "PERSON",
+    "HAND",
+    "LINT_ROLLER",
+    "SINK"
+  ]
+}

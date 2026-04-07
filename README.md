@@ -3,7 +3,7 @@
 Self-contained multi-class object detection with pixel-level masks.
 Supports **text**, **image (geometry)**, or **both** prompt types per class.
 
-> **First time?** Start with [`setup/`](setup/) — it has everything you need to build the
+> **First time?** Start with [`setup/`](setup/) -- it has everything you need to build the
 > Docker environment and TensorRT engines from scratch. See [`setup/README.md`](setup/README.md).
 
 ## Folder Structure
@@ -12,8 +12,8 @@ Supports **text**, **image (geometry)**, or **both** prompt types per class.
 sam3_pipeline/
 ├── setup/                    # Environment setup & engine building (run first!)
 │   ├── README.md             #   Step-by-step guide (from zero)
-│   ├── export_sam3_to_onnx.py #  PyTorch → ONNX export script
-│   └── onnx_to_tensorrt.sh   #  ONNX → TensorRT engine builder
+│   ├── export_sam3_to_onnx.py #  PyTorch -> ONNX export script
+│   └── onnx_to_tensorrt.sh   #  ONNX -> TensorRT engine builder
 ├── engines/                  # TensorRT engines (organised by variant)
 │   ├── b8_q200/              #   1008, batch=8, queries=200
 │   ├── b8_q50/               #   1008, batch=8, queries=50 (recommended default)
@@ -33,341 +33,135 @@ sam3_pipeline/
 ├── references/               # Reference images for image prompts
 ├── outputs/                  # Detection results
 ├── config.json               # Class definitions (default: b8_q200 engines)
-├── config_q50.json           # Same classes, pointing to b8_q50 engines
 ├── config_editor.py          # Visual config editor (standalone, see below)
 ├── extract.py                # Step 1: pre-compute prompt features
 ├── infer.py                  # Step 2: run detection (single camera)
 ├── infer_multi.py            # Step 2 alt: multi-camera pipeline (8 cameras)
-├── BENCH_decoder_queries.md   # QUERIES optimization experiment (Q200→Q50)
+├── BENCH_decoder_queries.md   # QUERIES optimization experiment (Q200->Q50)
 ├── BENCH_resolution_video.md  # r448 vs r560 benchmark + video output overhead
 ├── benchmark.sh               # Automated benchmark script (all resolutions)
 ├── setup/TUTOR_quantization.md  # INT8 quantization guide & experiment
 └── setup/TUTOR_resolution.md    # Resolution tuning guide & benchmarks
 ```
 
-## Prerequisites
+## Config Format
 
-**Before running the pipeline**, you need TensorRT engines and a Docker environment.
-If you don't have these yet, follow the guide in [`setup/README.md`](setup/README.md) first.
-
-## Quick Start
-
-All commands run inside the `sam3_trt` Docker container (see [`setup/`](setup/) to create it).
-
-### Step 1: Configure classes
-
-Edit `config.json` by hand, or use the visual editor (see [Config Editor](#config-editor) below):
+Each config JSON defines engine paths, tokenizer, feature directory, confidence threshold, and detection classes:
 
 ```json
 {
-  "engines": "engines/b8_q200",
+  "engines": "engines/b8_q50_r448",
   "tokenizer": "engines/tokenizer.json",
   "features": "features",
   "confidence": 0.3,
   "classes": [
-    {"name": "person", "prompt_type": "text", "text": "person"},
-    {"name": "hand",   "prompt_type": "text", "text": "hand"}
+    {"name": "PERSON", "prompt_type": "text", "text": "people"},
+    {"name": "HAND", "prompt_type": "text", "text": "hand"}
   ]
 }
 ```
 
-Switch to the VRAM-optimised engine by changing `"engines"` to `"engines/b8_q50"`. See [`optimize.md`](optimize.md) for details.
+### Class Definition Fields
 
-### Step 2: Extract prompt features
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Uppercase class identifier (e.g., `PERSON`, `HAND`) |
+| `prompt_type` | Yes | `"text"` (text prompt only), `"image"` (reference images only), or `"both"` |
+| `text` | For text/both | Text description for the class (e.g., `"people"`, `"hand"`) |
+| `references` | For image/both | List of reference image paths with bounding boxes |
 
-```bash
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/extract.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config.json
-```
+### Available Config Variants
 
-This runs once per config change. Unchanged classes are cached automatically.
+| Config File | Resolution | Classes | Use Case |
+|-------------|-----------|---------|----------|
+| `config_2cls_r448.json` | 448 | person, hand | Fastest, lowest VRAM |
+| `config_2cls_r434.json` | 434 | person, hand | Balanced speed/accuracy |
+| `config_r448.json` | 448 | person, hand (+ extras) | Extended classes |
+| `config_r560.json` | 560 | multi-class | Higher accuracy |
+| `config.json` | 1008 (default) | multi-class | Full accuracy |
+| `config_bakery.json` | varies | bakery-specific | Domain-specific |
 
-### Step 3: Run inference
+## Adding a New Detection Class
 
-**Single image:**
-
-```bash
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/infer.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config.json \
-  --images /root/VisionDSL/models/sam3_pipeline/Inputs/demo_3.jpg \
-  --output /root/VisionDSL/models/sam3_pipeline/outputs
-```
-
-**Video (adaptive real-time):**
-
-```bash
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/infer.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config.json \
-  --video /root/VisionDSL/models/sam3_pipeline/Inputs/media1.mp4 \
-  --output /root/VisionDSL/models/sam3_pipeline/outputs
-
-# With overlay video output (debug mode)
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/infer.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config.json \
-  --video /root/VisionDSL/models/sam3_pipeline/Inputs/media1.mp4 \
-  --output /root/VisionDSL/models/sam3_pipeline/outputs \
-  --save-video
-```
-
-Video mode simulates real-time playback: after each inference, the video clock
-advances by the actual inference time. Frames that arrive while the GPU is busy
-are dropped — exactly like a live camera feed.
-
-When `--save-video` is enabled, overlay frames are written directly to AVI (MJPG)
-in real-time during inference, then batch-converted to MP4 (H.264) after completion.
-This adds **zero overhead** to inference speed (see [`BENCH_resolution_video.md`](BENCH_resolution_video.md)).
-Video output is for **debug purposes only** — omit for benchmarking and production.
-
-## Output Files
-
-Each run produces timestamped output files (`YYYYMMDD_HHMMSS` prefix), so multiple runs don't overwrite each other.
-
-**Image mode:**
-
-| File | Description |
-|------|-------------|
-| `{name}_overlay.jpg` | Image with coloured mask overlays + labels |
-| `{name}_mask_{class}.png` | Binary mask per class (only with `--masks`) |
-| `{timestamp}_detections.jsonl` | Per-image detections (streaming JSONL) |
-| `{timestamp}_performance.json` | Timing stats (avg/min/max/p95 ms, estimated FPS) |
-
-**Video mode:**
-
-| File | Description |
-|------|-------------|
-| `{timestamp}_detections.jsonl` | Per-frame detections (streaming JSONL, `tail -f` compatible) |
-| `{timestamp}_performance.json` | Timing stats |
-| `{timestamp}_output.mp4` | Overlay video (only with `--save-video`) |
-
-**Multi-camera video mode (`--save-video --save-cameras`):**
-
-| File | Description |
-|------|-------------|
-| `{timestamp}_detections.jsonl` | Per-frame detections for all cameras |
-| `{timestamp}_performance.json` | Timing stats |
-| `{timestamp}_grid.mp4` | 2×4 grid overview video (only with `--save-video`) |
-| `{timestamp}_cam{N}_{label}.mp4` | Per-camera overlay video (only with `--save-cameras`) |
-
-## CLI Flags
-
-### `infer.py` (single camera)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--config` | (required) | Path to config.json |
-| `--images` | — | Image file paths (mutually exclusive with --video) |
-| `--video` | — | Video file path |
-| `--output` | `outputs` | Output directory |
-| `--conf` | from config | Confidence threshold override |
-| `--interval` | `1` | Min frame gap (video); 1=GPU-adaptive, N=at most every Nth frame |
-| `--masks` | `false` | Save per-class mask PNGs |
-| `--save-video` | `false` | Save overlay video (debug). Adds rendering but zero inference overhead |
-
-## Prompt Types
-
-### Text prompt
-
-Describe the object with a word or phrase. Uses the text encoder.
-
-```json
-{"name": "person", "prompt_type": "text", "text": "person"}
-```
-
-### Image prompt (geometry)
-
-Point to the object in a reference image using bounding boxes.
-Boxes are in **normalised cxcywh** format: `[center_x, center_y, width, height]`, values 0.0–1.0.
-Labels: `1` = positive (this is the object), `0` = negative (not this).
+1. **Define the class** in your config JSON:
 
 ```json
 {
-  "name": "my_cup",
-  "prompt_type": "image",
-  "references": [
-    {"image": "references/cup.jpg", "boxes": [[0.5, 0.5, 0.3, 0.4]], "labels": [1]}
-  ]
+  "name": "COFFEE_CUP",
+  "prompt_type": "text",
+  "text": "coffee cup"
 }
 ```
 
-### Combined prompt (both)
-
-Text description + reference image. Features are concatenated.
+For uncommon objects, use image references:
 
 ```json
 {
-  "name": "red_cup",
+  "name": "LINT_ROLLER",
   "prompt_type": "both",
-  "text": "cup",
-  "references": [
-    {"image": "references/red_cup.jpg", "boxes": [[0.5, 0.5, 0.3, 0.4]], "labels": [1]}
-  ]
+  "text": "lint roller",
+  "references": ["references/lint_roller1.jpg"]
 }
 ```
 
-## Limits
-
-| Constraint | Value |
-|------------|-------|
-| Max classes | 8 (decoder batch dimension; adjustable, see [`setup/README.md`](setup/README.md)) |
-| Max prompt tokens | 60 (text=32, each geo box=2 tokens) |
-| Max geo boxes per class | 20 |
-
-## Performance & VRAM (benchmarked on RTX 5090)
-
-### Single camera (`infer.py`, 4 classes: 3 text + 1 image, Q50)
-
-| Resolution | Engine variant | Avg ms | FPS | VRAM buffers |
-|:---:|---------------|:---:|:---:|:---:|
-| 1008 | b8_q50 | 62.5 ms | 16.0 | **7,064 MB** |
-| 840 | b8_q50_r840 | 50.3 ms | 19.9 | **6,050 MB** |
-| 672 | b8_q50_r672 | 35.1 ms | 28.5 | **4,582 MB** |
-| **560** | b8_q50_r560 | **30.3 ms** | **33.0** | **195 MB** |
-| **448** | b8_q50_r448 | **26.1 ms** | **38.4** | **125 MB** |
-
-### Multi-camera (`infer_multi.py`, 8 cameras, 3 videos cycled, Q50)
-
-| Resolution | Avg ms/round | Per camera | FPS/cam | Total FPS | Buffers |
-|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1008 (Q200) | 426 ms | 53 ms | 2.3 | 18.8 | 1,998 MB |
-| 1008 (Q50) | 425 ms | 53 ms | 2.3 | 18.8 | 1,238 MB |
-| 840 | 446 ms | 55.8 ms | 2.2 | 17.9 | — |
-| **672** | **253 ms** | **31.6 ms** | **4.0** | **31.7** | — |
-| **560** | **132.8 ms** | **16.6 ms** | **7.5** | **60.2** | **383 MB** |
-| **448** | **108.6 ms** | **13.6 ms** | **9.2** | **73.6** | **246 MB** |
-
-> **8 GB deployment**: 560 (7.5 FPS/cam) or 448 (9.2 FPS/cam) recommended.
-> 840 requires 12.9 GB — not feasible on 8 GB GPUs.
-> Q50 saves ~1.2 GB vs Q200 with zero quality loss. See [`optimize.md`](optimize.md).
-> Video output (`--save-video`) adds zero inference overhead. See [`BENCH_resolution_video.md`](BENCH_resolution_video.md).
-
-For resolution selection guide, see [`setup/resolution_guide.md`](setup/resolution_guide.md).
-For INT8 quantization experiment, see [`setup/quantization_guide.md`](setup/quantization_guide.md).
-
-- First frame includes warmup and is slower (~100–350 ms)
-- VRAM is dominated by TensorRT activation memory, pre-allocated for `maxShapes` at engine load time
-- `QUERIES` and `IMAGE_SIZE` are auto-detected from engine files — no manual configuration needed
-- To change the max class limit, rebuild engines with a different batch size (see [`setup/README.md`](setup/README.md))
-
-## Multi-Camera Mode (`infer_multi.py`)
-
-For processing multiple camera feeds simultaneously (Plan C v3 architecture).
-
-**Single video (duplicated across all cameras):**
+2. **Extract features** (inside Docker container):
 
 ```bash
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config.json \
-  --video /root/VisionDSL/models/sam3_pipeline/Inputs/media1.mp4 \
-  --cameras 8 \
-  --output /root/VisionDSL/models/sam3_pipeline/outputs
+cd /root/VisionDSL/models/sam3_pipeline
+python3 extract.py --config config.json
 ```
 
-**Multiple videos (cycled to fill camera slots):**
+This generates `features/{CLASS_NAME}/features.npy`, `mask.npy`, and `meta.json`.
+
+3. **Run inference** to verify:
 
 ```bash
-# 3 videos → 8 cameras: shop,hair,car,shop,hair,car,shop,hair
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
-  --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
-  --cameras 8
-
-# 8 unique videos (production scenario)
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
-  --video cam1.mp4 cam2.mp4 cam3.mp4 cam4.mp4 cam5.mp4 cam6.mp4 cam7.mp4 cam8.mp4 \
-  --cameras 8
+python3 infer.py --config config.json --input Inputs/test.jpg
 ```
 
-**With video output (debug mode):**
+## Engine Versions and Resolutions
 
-```bash
-# Grid video only
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
-  --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
-  --cameras 8 --save-video
+TensorRT engines are **GPU-architecture-specific** -- engines built on one GPU will not work on another architecture. Rebuild with `setup/onnx_to_tensorrt.sh` when deploying to a new GPU.
 
-# Grid + individual camera videos
-docker exec william_tensorrt python3 \
-  /root/VisionDSL/models/sam3_pipeline/infer_multi.py \
-  --config /root/VisionDSL/models/sam3_pipeline/config_q50.json \
-  --video Inputs/shop.mp4 Inputs/hair.mp4 Inputs/car.mp4 \
-  --cameras 8 --save-video --save-cameras
+| Engine Directory | Resolution | Batch | Queries | Notes |
+|------------------|-----------|-------|---------|-------|
+| `b8_q50_r448` | 448 | 8 | 50 | Fastest, recommended for real-time |
+| `b8_q50_r560` | 560 | 8 | 50 | Good balance |
+| `b8_q50_r672` | 672 | 8 | 50 | Fits in 8 GB VRAM |
+| `b8_q50_r840` | 840 | 8 | 50 | High accuracy |
+| `b8_q50` | 1008 | 8 | 50 | Maximum accuracy |
+| `b8_q200` | 1008 | 8 | 200 | Legacy, more queries |
+| `b8_q50_int8` | 1008 | 8 | 50 | INT8 quantized (experimental) |
+
+Lower resolution = faster inference + lower VRAM. Higher resolution = better accuracy for small objects.
+
+## Integration with VisionDSL
+
+The `SAM3PipelineAdapter` in `backends/sam3_pipeline.py` wraps the pipeline for use with VisionDSL:
+
+```python
+from backends.sam3_pipeline import SAM3PipelineAdapter
+from dsl import VisionPipeline
+
+# Create detector adapter
+detector = SAM3PipelineAdapter(
+    config_path='models/sam3_pipeline/config_r448.json',
+    conf=0.3
+)
+
+# Wire into VisionDSL pipeline
+pipeline = VisionPipeline(
+    config_path='configs/rules.json',
+    zones_config_path='configs/zones.json',
+    detector=detector
+)
+
+# Process a frame
+result = pipeline.process_frame(frame, timestamp=0.0)
 ```
 
-Videos are written as AVI (MJPG) in real-time during inference, then batch-converted
-to MP4 (H.264) after completion. The original AVIs are deleted on successful conversion.
-This adds **zero inference overhead** — use without `--save-video` only when you want
-smaller output directories. See [`BENCH_resolution_video.md`](BENCH_resolution_video.md) for benchmark proof.
-
-Key optimisations:
-- **VE batch=F**: all camera frames in one vision encoder pass
-- **Zero-copy FPN**: VE output buffers directly used as decoder input
-- **Decoder iterates per class**: each with batch=F (all frames)
-- **Double-buffered decoder output**: decoder N+1 overlaps mask copy N
-- **Selective mask copy**: only transfer masks for detected objects (~40x less PCIe bandwidth)
-- **Auto-detection**: IMAGE_SIZE and QUERIES read from engine files — no manual config
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--config` | (required) | Path to config.json |
-| `--video` | (required) | Video file(s); cycled if fewer than `--cameras` |
-| `--cameras` | `8` | Number of camera slots |
-| `--output` | `outputs` | Output directory |
-| `--conf` | from config | Confidence threshold override |
-| `--interval` | `1` | Min frame gap |
-| `--save-video` | `false` | Save 2×4 grid overlay video (AVI → MP4) |
-| `--save-cameras` | `false` | Save individual camera overlay videos (one MP4 per camera) |
-
-## Two-Step Workflow
-
-```
-config.json  ──>  extract.py  ──>  features/   ──>  infer.py  ──>  outputs/
- (define)          (once)        (cached)          (per frame)     (results)
-```
-
-Only `extract.py` needs the text/geometry encoders. `infer.py` only loads the
-vision encoder + decoder, making it fast and lightweight.
-
-## Config Editor
-
-A standalone visual tool for editing `config.json`. Especially useful for **image prompts**, where you need to draw bounding boxes on reference images to get the normalised cxcywh coordinates.
-
-- **No dependencies** — pure Python (`http.server`), single file, no pip install needed
-- **No Docker required** — runs directly on the host machine
-- **Does not affect the pipeline** — only reads/writes `config.json` and serves reference images
-
-### Usage
-
-```bash
-# Run directly on host (NOT inside Docker)
-python3 /home/ubuntu/Documents/willy/repos/william/VisionDSL/models/sam3_pipeline/config_editor.py \
-  --config /home/ubuntu/Documents/willy/repos/william/VisionDSL/models/sam3_pipeline/config.json
-```
-
-Then open `http://localhost:8080` in your browser.
-
-### Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--config` | `config.json` in script directory | Path to config.json |
-| `--port` | `8080` | HTTP port |
-
-### Features
-
-- Add/delete classes (max 8), edit name and prompt type
-- Text prompts: edit the text field directly
-- Image prompts: select a reference image, click-drag to draw bounding boxes on a canvas
-- Each box has a positive/negative label toggle
-- Normalised cxcywh coordinates are computed automatically
-- Save with button or `Ctrl+S`, dirty state tracking
-- Dark theme UI
+The adapter:
+- Auto-lowercases class names (`PERSON` -> `person`, `HAND` -> `hand`)
+- Passes pixel-level masks through `Detection.attributes['mask']`
+- Recomputes tight bounding boxes from masks (decoder bbox is often too small)
+- Supports `MultiCameraPipelineAdapter` for batched multi-camera inference (up to 8 cameras)

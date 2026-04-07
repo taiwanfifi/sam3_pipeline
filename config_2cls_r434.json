@@ -1,0 +1,10 @@
+{
+  "engines": "engines/b8_q50_r434",
+  "tokenizer": "engines/tokenizer.json",
+  "features": "features",
+  "confidence": 0.3,
+  "classes": [
+    {"name": "PERSON", "prompt_type": "text", "text": "people"},
+    {"name": "HAND", "prompt_type": "text", "text": "hand"}
+  ]
+}
