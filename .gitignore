@@ -9,6 +9,7 @@ Inputs/
 
 # Inference outputs
 outputs/
+baseline_output/
 
 # Reference images
 references/
